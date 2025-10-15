@@ -4504,7 +4504,7 @@ static int irdma_req_notify_cq(struct ib_cq *ibcq,
 	}
 
 	if ((notify_flags & IB_CQ_REPORT_MISSED_EVENTS) &&
-	    (!irdma_cq_empty(iwcq) || !list_empty(&iwcq->cmpl_generated)))
+	    (!irdma_uk_cq_empty(ukcq) || !list_empty(&iwcq->cmpl_generated)))
 		ret = 1;
 	spin_unlock_irqrestore(&iwcq->lock, flags);
 
