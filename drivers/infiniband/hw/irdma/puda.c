@@ -758,13 +758,6 @@ static int irdma_puda_cq_wqe(struct irdma_sc_dev *dev, struct irdma_sc_cq *cq)
 	irdma_sc_cqp_post_sq(dev->cqp);
 	status = irdma_sc_poll_for_cqp_op_done(dev->cqp, IRDMA_CQP_OP_CREATE_CQ,
 					       &compl_info);
-	if (!status) {
-		struct irdma_sc_ceq *ceq = dev->ceq[0];
-
-		if (ceq && ceq->reg_cq)
-			status = irdma_sc_add_cq_ctx(ceq, cq);
-	}
-
 	return status;
 }
 
@@ -897,23 +890,17 @@ void irdma_puda_dele_rsrc(struct irdma_sc_vsi *vsi, enum puda_rsrc_type type,
 	struct irdma_puda_buf *buf = NULL;
 	struct irdma_puda_buf *nextbuf = NULL;
 	struct irdma_virt_mem *vmem;
-	struct irdma_sc_ceq *ceq;
 
-	ceq = vsi->dev->ceq[0];
 	switch (type) {
 	case IRDMA_PUDA_RSRC_TYPE_ILQ:
 		rsrc = vsi->ilq;
 		vmem = &vsi->ilq_mem;
 		vsi->ilq = NULL;
-		if (ceq && ceq->reg_cq)
-			irdma_sc_remove_cq_ctx(ceq, &rsrc->cq);
 		break;
 	case IRDMA_PUDA_RSRC_TYPE_IEQ:
 		rsrc = vsi->ieq;
 		vmem = &vsi->ieq_mem;
 		vsi->ieq = NULL;
-		if (ceq && ceq->reg_cq)
-			irdma_sc_remove_cq_ctx(ceq, &rsrc->cq);
 		break;
 	default:
 		ibdev_dbg(to_ibdev(dev), "PUDA: error resource type = 0x%x\n",
