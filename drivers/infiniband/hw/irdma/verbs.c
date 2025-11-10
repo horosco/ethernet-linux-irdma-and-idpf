@@ -3657,6 +3657,8 @@ static int irdma_hwdereg_mr(struct ib_mr *ib_mr)
 	info->pd_id = iwpd->sc_pd.pd_id;
 	info->stag_idx = ib_mr->rkey >> IRDMA_CQPSQ_STAG_IDX_S;
 	info->mr = true;
+	if (iwmr->type != IRDMA_MEMREG_TYPE_MEM)
+		info->skip_flush_markers = true;
 	if (iwpbl->pbl_allocated)
 		info->dealloc_pbl = true;
 
