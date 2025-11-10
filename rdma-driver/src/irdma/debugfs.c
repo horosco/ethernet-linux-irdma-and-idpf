@@ -888,7 +888,16 @@ static void dump_stats_cmd(struct irdma_device *iwdev)
 		      iwdev->ah_nosleep_list_cnt);
 	dbg_vsnprintf("AH list cnt HWM(nosleep)            %d\n",
 		      iwdev->ah_nosleep_list_hwm);
-
+	dbg_vsnprintf("MAD QP Posted Send WRs           %lld\n",
+		      iwdev->mad_qp_posted_send_wrs);
+	dbg_vsnprintf("MAD QP Completed Send WRs        %lld\n",
+		      iwdev->mad_qp_completed_send_wrs);
+	dbg_vsnprintf("MAD QP Posted Recv WRs           %lld\n",
+		      iwdev->mad_qp_posted_recv_wrs);
+	dbg_vsnprintf("MAD QP Completed Recv WRs        %lld\n",
+		      iwdev->mad_qp_completed_recv_wrs);
+	dbg_vsnprintf("MAD QP Completed Error WRs       %lld\n",
+		      iwdev->mad_qp_completed_error_wrs);
 #if IS_ENABLED(CONFIG_CONFIGFS_FS)
 	if  (iwdev->roce_mode) {
 		dbg_vsnprintf("roce rtomin  = %d\n", iwdev->roce_rtomin);

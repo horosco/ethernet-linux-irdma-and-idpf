@@ -71,7 +71,7 @@ static u32 idpf_get_rxfh_key_size(struct net_device *netdev)
 	struct idpf_vport_user_config_data *user_config;
 
 	if (!idpf_is_cap_ena_all(np->adapter, IDPF_RSS_CAPS, IDPF_CAP_RSS))
-		return -EOPNOTSUPP;
+		return 0;
 
 	user_config = &np->adapter->vport_config[np->vport_idx]->user_config;
 
@@ -90,7 +90,7 @@ static u32 idpf_get_rxfh_indir_size(struct net_device *netdev)
 	struct idpf_vport_user_config_data *user_config;
 
 	if (!idpf_is_cap_ena_all(np->adapter, IDPF_RSS_CAPS, IDPF_CAP_RSS))
-		return -EOPNOTSUPP;
+		return 0;
 
 	user_config = &np->adapter->vport_config[np->vport_idx]->user_config;
 
@@ -134,7 +134,7 @@ static int idpf_get_rxfh(struct net_device *netdev, u32 *indir, u8 *key)
 	}
 
 	rss_data = &adapter->vport_config[np->vport_idx]->user_config.rss_data;
-	if (!np->active)
+	if (!test_bit(IDPF_VPORT_UP, np->state))
 		goto unlock_mutex;
 #if defined(HAVE_ETHTOOL_RXFH_PARAM)
 	rxfh->hfunc = ETH_RSS_HASH_TOP;
@@ -199,7 +199,7 @@ static int idpf_set_rxfh(struct net_device *netdev, const u32 *indir,
 	}
 
 	rss_data = &adapter->vport_config[vport->idx]->user_config.rss_data;
-	if (!np->active)
+	if (!test_bit(IDPF_VPORT_UP, np->state))
 		goto unlock_mutex;
 
 #if defined(HAVE_ETHTOOL_RXFH_PARAM) || defined(HAVE_RXFH_HASHFUNC)
@@ -372,6 +372,12 @@ static void idpf_get_ringparam(struct net_device *netdev,
 	ring->rx_pending = q_grp->rxq_desc_count;
 	ring->tx_pending = q_grp->txq_desc_count;
 
+#ifdef HAVE_ETHTOOL_EXTENDED_RINGPARAMS
+#if IS_ENABLED(CONFIG_ETHTOOL_NETLINK) && defined(HAVE_ETHTOOL_SUPPORT_TCP_DATA_SPLIT)
+	kring->tcp_data_split = idpf_vport_get_hsplit(vport);
+#endif /* CONFIG_ETHTOOL_NETLINK && HAVE_ETHTOOL_SUPPORT_TCP_DATA_SPLIT */
+#endif /* HAVE_ETHTOOL_EXTENDED_RINGPARAMS */
+
 	idpf_vport_cfg_unlock(adapter);
 }
 
@@ -452,6 +458,18 @@ static int idpf_set_ringparam(struct net_device *netdev,
 	    new_rx_count == q_grp->rxq_desc_count)
 		goto unlock_mutex;
 
+#ifdef HAVE_ETHTOOL_EXTENDED_RINGPARAMS
+#if IS_ENABLED(CONFIG_ETHTOOL_NETLINK) && defined(HAVE_ETHTOOL_SUPPORT_TCP_DATA_SPLIT)
+	if (!idpf_vport_set_hsplit(vport, kring->tcp_data_split)) {
+		NL_SET_ERR_MSG_MOD(ext_ack,
+				   "setting TCP data split is not supported");
+		err = -EOPNOTSUPP;
+
+		goto unlock_mutex;
+	}
+#endif /* CONFIG_ETHTOOL_NETLINK && HAVE_ETHTOOL_SUPPORT_TCP_DATA_SPLIT */
+#endif /* HAVE_ETHTOOL_EXTENDED_RINGPARAMS */
+
 	config_data = &vport->adapter->vport_config[idx]->user_config;
 	config_data->num_req_txq_desc = new_tx_count;
 	config_data->num_req_rxq_desc = new_rx_count;
@@ -522,16 +540,7 @@ static const struct idpf_stats idpf_gstrings_tx_queue_stats[] = {
 #ifdef CONFIG_TX_TIMEOUT_VERBOSE
 	IDPF_QUEUE_STAT("busy_q_restarts", q_stats.tx.busy_q_restarts),
 	IDPF_QUEUE_STAT("busy_low_txq_descs", q_stats.tx.busy_low_txq_descs),
-	IDPF_QUEUE_STAT("busy_low_rsv_bufs", q_stats.tx.busy_low_rsv_bufs),
 	IDPF_QUEUE_STAT("busy_too_many_pend_compl", q_stats.tx.busy_too_many_pend_compl),
-	IDPF_QUEUE_STAT("hash_tbl_pkt_cleans", q_stats.tx.hash_tbl_pkt_cleans),
-	IDPF_QUEUE_STAT("ring_pkt_cleans", q_stats.tx.ring_pkt_cleans),
-	IDPF_QUEUE_STAT("re_pkt_stash", q_stats.tx.re_pkt_stash),
-	IDPF_QUEUE_STAT("re_pkt_stash_fail", q_stats.tx.re_pkt_stash_fail),
-	IDPF_QUEUE_STAT("ooo_compl_stash", q_stats.tx.ooo_compl_stash),
-	IDPF_QUEUE_STAT("ooo_compl_stash_fail", q_stats.tx.ooo_compl_stash_fail),
-	IDPF_QUEUE_STAT("re_invalid_first_buf", q_stats.tx.re_invalid_first_buf),
-	IDPF_QUEUE_STAT("rs_invalid_first_buf", q_stats.tx.rs_invalid_first_buf),
 	IDPF_QUEUE_STAT("complq_clean_incomplete", q_stats.tx.complq_clean_incomplete),
 	IDPF_QUEUE_STAT("sharedrxq_clean_incomplete", q_stats.tx.sharedrxq_clean_incomplete),
 #endif /* CONFIG_TX_TIMEOUT_VERBOSE */
@@ -1204,7 +1213,7 @@ static void idpf_get_ethtool_stats(struct net_device *netdev,
 	idpf_vport_cfg_lock(adapter);
 	vport = idpf_netdev_to_vport(netdev);
 
-	if (!np->active) {
+	if (!test_bit(IDPF_VPORT_UP, np->state)) {
 		idpf_vport_cfg_unlock(adapter);
 		return;
 	}
@@ -1309,7 +1318,7 @@ static int idpf_get_q_coalesce(struct net_device *netdev,
 	idpf_vport_cfg_lock(adapter);
 	vport = idpf_netdev_to_vport(netdev);
 
-	if (!np->active)
+	if (!test_bit(IDPF_VPORT_UP, np->state))
 		goto unlock_mutex;
 
 	q_grp = &vport->dflt_grp.q_grp;
@@ -1380,12 +1389,14 @@ static int idpf_get_per_q_coalesce(struct net_device *netdev, u32 q_num,
 /**
  * __idpf_set_q_coalesce - set ITR values for specific queue
  * @ec: ethtool structure from user to update ITR settings
+ * @q_coal: per queue coalesce settings
  * @q: queue for which itr values has to be set
  * @is_rxq: is queue type rx
  *
  * Returns 0 on success, negative otherwise.
  */
 static int __idpf_set_q_coalesce(struct ethtool_coalesce *ec,
+				 struct idpf_q_coalesce *q_coal,
 				 struct idpf_queue *q, bool is_rxq)
 {
 	u32 use_adaptive_coalesce, coalesce_usecs;
@@ -1431,20 +1442,25 @@ static int __idpf_set_q_coalesce(struct ethtool_coalesce *ec,
 
 	if (is_rxq) {
 		qv->rx_itr_value = coalesce_usecs;
+		q_coal->rx_coalesce_usecs = coalesce_usecs;
 		if (use_adaptive_coalesce) {
 			qv->rx_intr_mode = IDPF_ITR_DYNAMIC;
+			q_coal->rx_intr_mode = IDPF_ITR_DYNAMIC;
 		} else {
 			qv->rx_intr_mode = !IDPF_ITR_DYNAMIC;
-			idpf_vport_intr_write_itr(qv, qv->rx_itr_value,
-						  false);
+			q_coal->rx_intr_mode = !IDPF_ITR_DYNAMIC;
+			idpf_vport_intr_write_itr(qv, coalesce_usecs, false);
 		}
 	} else {
 		qv->tx_itr_value = coalesce_usecs;
+		q_coal->tx_coalesce_usecs = coalesce_usecs;
 		if (use_adaptive_coalesce) {
 			qv->tx_intr_mode = IDPF_ITR_DYNAMIC;
+			q_coal->tx_intr_mode = IDPF_ITR_DYNAMIC;
 		} else {
 			qv->tx_intr_mode = !IDPF_ITR_DYNAMIC;
-			idpf_vport_intr_write_itr(qv, qv->tx_itr_value, true);
+			q_coal->tx_intr_mode = !IDPF_ITR_DYNAMIC;
+			idpf_vport_intr_write_itr(qv, coalesce_usecs, true);
 		}
 	}
 
@@ -1457,6 +1473,7 @@ static int __idpf_set_q_coalesce(struct ethtool_coalesce *ec,
 /**
  * idpf_set_q_coalesce - set ITR values for specific queue
  * @vport: vport associated to the queue that need updating
+ * @q_coal: per queue coalesce settings
  * @ec: coalesce settings to program the device with
  * @q_num: update ITR/INTRL (coalesce) settings for this queue number/index
  * @is_rxq: is queue type rx
@@ -1464,6 +1481,7 @@ static int __idpf_set_q_coalesce(struct ethtool_coalesce *ec,
  * Return 0 on success, and negative on failure
  */
 static int idpf_set_q_coalesce(struct idpf_vport *vport,
+			       struct idpf_q_coalesce *q_coal,
 			       struct ethtool_coalesce *ec,
 			       int q_num, bool is_rxq)
 {
@@ -1477,7 +1495,7 @@ static int idpf_set_q_coalesce(struct idpf_vport *vport,
 			vport->txqs[q_num]->txq_grp->complq :
 			vport->txqs[q_num];
 
-	if (q && __idpf_set_q_coalesce(ec, q, is_rxq))
+	if (q && __idpf_set_q_coalesce(ec, q_coal, q, is_rxq))
 		return -EINVAL;
 
 	return 0;
@@ -1503,26 +1521,32 @@ static int idpf_set_coalesce(struct net_device *netdev,
 #endif /* HAVE_ETHTOOL_COALESCE_EXTACK */
 {
 	struct idpf_netdev_priv *np = netdev_priv(netdev);
+	struct idpf_vport_user_config_data *user_config;
 	struct idpf_adapter *adapter = np->adapter;
+	struct idpf_q_coalesce *q_coal;
 	struct idpf_vport *vport;
 	struct idpf_q_grp *q_grp;
 	int i, err = 0;
 
+	user_config = &np->adapter->vport_config[np->vport_idx]->user_config;
+
 	idpf_vport_cfg_lock(adapter);
 	vport = idpf_netdev_to_vport(netdev);
 
-	if (!np->active)
+	if (!test_bit(IDPF_VPORT_UP, np->state))
 		goto unlock_mutex;
 
 	for (i = 0; i < vport->num_txq; i++) {
-		err = idpf_set_q_coalesce(vport, ec, i, false);
+		q_coal = &user_config->q_coalesce[i];
+		err = idpf_set_q_coalesce(vport, q_coal, ec, i, false);
 		if (err)
 			goto unlock_mutex;
 	}
 
 	q_grp = &vport->dflt_grp.q_grp;
 	for (i = 0; i < q_grp->num_rxq; i++) {
-		err = idpf_set_q_coalesce(vport, ec, i, true);
+		q_coal = &user_config->q_coalesce[i];
+		err = idpf_set_q_coalesce(vport, q_coal, ec, i, true);
 		if (err)
 			goto unlock_mutex;
 	}
@@ -1546,22 +1570,27 @@ static int idpf_set_per_q_coalesce(struct net_device *netdev, u32 q_num,
 				   struct ethtool_coalesce *ec)
 {
 	struct idpf_adapter *adapter = idpf_netdev_to_adapter(netdev);
+	struct idpf_netdev_priv *np = netdev_priv(netdev);
+	struct idpf_vport_user_config_data *user_config;
+	struct idpf_q_coalesce *q_coal;
 	struct idpf_vport *vport;
 	struct idpf_q_grp *q_grp;
 	int err = 0;
 
 	idpf_vport_cfg_lock(adapter);
 	vport = idpf_netdev_to_vport(netdev);
+	user_config = &np->adapter->vport_config[np->vport_idx]->user_config;
+	q_coal = &user_config->q_coalesce[q_num];
 
 	if (q_num < vport->num_txq) {
-		err = idpf_set_q_coalesce(vport, ec, q_num, false);
+		err = idpf_set_q_coalesce(vport, q_coal, ec, q_num, false);
 		if (err)
 			goto vport_unlock;
 	}
 
 	q_grp = &vport->dflt_grp.q_grp;
 	if (q_num < q_grp->num_rxq)
-		err = idpf_set_q_coalesce(vport, ec, q_num, true);
+		err = idpf_set_q_coalesce(vport, q_coal, ec, q_num, true);
 
 vport_unlock:
 	idpf_vport_cfg_unlock(adapter);
@@ -1723,6 +1752,9 @@ static const struct ethtool_ops idpf_ethtool_ops = {
 				     ETHTOOL_COALESCE_USE_ADAPTIVE,
 #endif /* ETHTOOL_COALESCE_USECS */
 	.get_drvinfo		= idpf_get_drvinfo,
+#ifdef HAVE_ETHTOOL_SUPPORTED_RING_PARAMS
+	.supported_ring_params	= ETHTOOL_RING_USE_TCP_DATA_SPLIT,
+#endif /* HAVE_ETHTOOL_SUPPORTED_RING_PARAMS */
 	.get_msglevel		= idpf_get_msglevel,
 	.set_msglevel		= idpf_set_msglevel,
 	.get_link		= ethtool_op_get_link,

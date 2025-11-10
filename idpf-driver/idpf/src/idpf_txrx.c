@@ -11,36 +11,6 @@
 #include "idpf_lan_txrx.h"
 #include "idpf_ptp.h"
 
-/**
- * idpf_buf_lifo_push - push a buffer pointer onto stack
- * @stack: pointer to stack struct
- * @buf: pointer to buf to push
- *
- * Returns 0 on success, negative on failure
- **/
-static int idpf_buf_lifo_push(struct idpf_buf_lifo *stack,
-			      struct idpf_tx_stash *buf)
-{
-	if (unlikely(stack->top == stack->size))
-		return -ENOSPC;
-
-	stack->bufs[stack->top++] = buf;
-
-	return 0;
-}
-
-/**
- * idpf_buf_lifo_pop - pop a buffer pointer from stack
- * @stack: pointer to stack struct
- **/
-static struct idpf_tx_stash *idpf_buf_lifo_pop(struct idpf_buf_lifo *stack)
-{
-	if (unlikely(!stack->top))
-		return NULL;
-
-	return stack->bufs[--stack->top];
-}
-
 #ifdef CONFIG_TX_TIMEOUT_VERBOSE
 static void idpf_dump_tx_data_flow_desc(struct idpf_queue *txq, u16 i)
 {
@@ -76,10 +46,8 @@ static void idpf_dump_tx_state(struct idpf_vport *vport, struct idpf_queue *txq)
 	struct idpf_queue *complq = txq->txq_grp->complq;
 	struct idpf_adapter *adapter = vport->adapter;
 	struct net_device *netdev = vport->netdev;
-	struct idpf_tx_stash *stash;
 	struct netdev_queue *nq;
 	unsigned int start;
-	u16 bkt;
 	int i;
 
 	nq = netdev_get_tx_queue(netdev, txq->idx);
@@ -93,28 +61,11 @@ static void idpf_dump_tx_state(struct idpf_vport *vport, struct idpf_queue *txq)
 	do {
 		start = u64_stats_fetch_begin(&txq->stats_sync);
 		netdev_info(netdev,
-			    "\t\t Busy events: total: %llu (restarts: %llu), low_txq_desc_avail: %llu, low_rsv_bufs: %llu, too_many_pending_compls: %llu\n",
+			    "\t\t Busy events: total: %llu (restarts: %llu), low_txq_desc_avail: %llu, too_many_pending_compls: %llu\n",
 			    u64_stats_read(&txq_stats->q_busy),
 			    u64_stats_read(&txq_stats->busy_q_restarts),
 			    u64_stats_read(&txq_stats->busy_low_txq_descs),
-			    u64_stats_read(&txq_stats->busy_low_rsv_bufs),
 			    u64_stats_read(&txq_stats->busy_too_many_pend_compl));
-		netdev_info(netdev,
-			    "\t\t Ring cleans: %llu, hash_tbl_cleans: %llu\n",
-			    u64_stats_read(&txq_stats->ring_pkt_cleans),
-			    u64_stats_read(&txq_stats->hash_tbl_pkt_cleans));
-		netdev_info(netdev,
-			    "\t\t RE invalid first buf: %llu, RS invalid first buf: %llu\n",
-			    u64_stats_read(&txq_stats->re_invalid_first_buf),
-			    u64_stats_read(&txq_stats->rs_invalid_first_buf));
-		netdev_info(netdev,
-			    "\t\t RE stash: %llu, RE stash fail: %llu\n",
-			    u64_stats_read(&txq_stats->re_pkt_stash),
-			    u64_stats_read(&txq_stats->re_pkt_stash_fail));
-		netdev_info(netdev,
-			    "\t\t OOO stash: %llu, OOO stash fail: %llu\n",
-			    u64_stats_read(&txq_stats->ooo_compl_stash),
-			    u64_stats_read(&txq_stats->ooo_compl_stash_fail));
 		netdev_info(netdev,
 			    "\t\t Complq clean incomplete: %llu, Rxq clean incomplete: %llu\n",
 			    u64_stats_read(&txq_stats->complq_clean_incomplete),
@@ -134,7 +85,6 @@ static void idpf_dump_tx_state(struct idpf_vport *vport, struct idpf_queue *txq)
 	} while (u64_stats_fetch_retry(&txq->stats_sync, start));
 
 	for (i = 0; i < txq->desc_count; i++) {
-		struct idpf_tx_buf *tx_buf = &txq->tx.bufs[i];
 		union idpf_flex_tx_ctx_desc *ctx_desc;
 		u16 cmd_dtype, dtype;
 
@@ -156,14 +106,6 @@ static void idpf_dump_tx_state(struct idpf_vport *vport, struct idpf_queue *txq)
 			netdev_info(netdev, "desc[%03i]: unsupported desc type\n", i);
 		}
 
-		netdev_info(netdev,
-			    "\t\ttx_buf[%03i]: type = %u, skb = %p, bytecount = %u, gso_segs = %u, dma_len = %u, dma_addr = 0x%016llx, eop_idx = %u compl_tag = %u (ring_idx = %u)\n",
-			    i, tx_buf->type, tx_buf->skb,
-			    tx_buf->bytecount, tx_buf->gso_segs,
-			    dma_unmap_len(tx_buf, len),
-			    dma_unmap_addr(tx_buf, dma),
-			    tx_buf->eop_idx, tx_buf->compl_tag,
-			    tx_buf->compl_tag & txq->compl_tag_bufid_m);
 	}
 
 	if (!idpf_is_queue_model_split(q_grp->txq_model))
@@ -185,17 +127,6 @@ static void idpf_dump_tx_state(struct idpf_vport *vport, struct idpf_queue *txq)
 			    q_head_compl_tag);
 	}
 
-	hash_for_each(txq->stash->sched_buf_hash, bkt, stash, hlist) {
-		if (stash)
-			netdev_err(netdev,
-				   "\tuncleaned tx_buf with compl_tag = %u, type = %u, dma_len = %u still in hash table\n",
-				   stash->buf.compl_tag, stash->buf.type,
-				   dma_unmap_len(&stash->buf, len));
-	}
-
-	netdev_err(netdev, "\tidpf_tx_buf_rsv_unused = %u\n",
-		   IDPF_TX_BUF_RSV_UNUSED(txq));
-
 	netdev_err(netdev,
 		   "txcomplq[%d]: ntc: %d, pending_compls: %u\n",
 		   complq->q_id, complq->next_to_clean,
@@ -203,6 +134,29 @@ static void idpf_dump_tx_state(struct idpf_vport *vport, struct idpf_queue *txq)
 }
 
 #endif /* CONFIG_TX_TIMEOUT_VERBOSE */
+/**
+ * idpf_chk_linearize - Check if skb exceeds max descriptors per packet
+ * @skb: send buffer
+ * @max_bufs: maximum scatter gather buffers for single packet
+ * @count: number of buffers this packet needs
+ *
+ * Make sure we don't exceed maximum scatter gather buffers for a single
+ * packet.
+ * TSO case has been handled earlier from idpf_features_check().
+ */
+static bool idpf_chk_linearize(const struct sk_buff *skb,
+			       unsigned int max_bufs,
+			       unsigned int count)
+{
+	if (likely(count <= max_bufs))
+		return false;
+
+	if (skb_is_gso(skb))
+		return false;
+
+	return true;
+}
+
 /**
  * idpf_tx_timeout - Respond to a Tx Hang
  * @netdev: network interface device structure
@@ -247,57 +201,21 @@ void idpf_tx_timeout(struct net_device *netdev)
 }
 
 /**
- * idpf_tx_buf_rel - Release a Tx buffer
- * @tx_q: the queue that owns the buffer
- * @tx_buf: the buffer to free
- */
-static void idpf_tx_buf_rel(struct idpf_queue *tx_q, struct idpf_tx_buf *tx_buf)
-{
-	if (tx_buf->type == IDPF_TX_BUF_SKB ||
-	    tx_buf->type == IDPF_TX_BUF_XDP) {
-		if (dma_unmap_len(tx_buf, len))
-			dma_unmap_single(tx_q->dev,
-					 dma_unmap_addr(tx_buf, dma),
-					 dma_unmap_len(tx_buf, len),
-					 DMA_TO_DEVICE);
-#ifdef HAVE_XDP_SUPPORT
-		if (test_bit(__IDPF_Q_XDP, tx_q->flags))
-#ifdef HAVE_XDP_FRAME_STRUCT
-			xdp_return_frame(tx_buf->xdpf);
-#else
-			page_frag_free(tx_buf->raw_buf);
-#endif /* HAVE_XDP_FRAME_STRUCT */
-		else
-			dev_kfree_skb_any(tx_buf->skb);
-#else
-		dev_kfree_skb_any(tx_buf->skb);
-#endif /* HAVE_XDP_SUPPORT */
-	} else if (tx_buf->type == IDPF_TX_BUF_FRAG) {
-		dma_unmap_page(tx_q->dev,
-			       dma_unmap_addr(tx_buf, dma),
-			       dma_unmap_len(tx_buf, len),
-			       DMA_TO_DEVICE);
-	}
-
-	tx_buf->skb = NULL;
-	tx_buf->nr_frags = 0;
-	tx_buf->type = IDPF_TX_BUF_EMPTY;
-	dma_unmap_len_set(tx_buf, len, 0);
-}
-
-/**
  * idpf_tx_buf_rel_all - Free any empty Tx buffers
  * @txq: queue to be cleaned
  */
 static void idpf_tx_buf_rel_all(struct idpf_queue *txq)
 {
-	struct idpf_tx_stash *stash;
-	struct hlist_node *tmp;
-	u16 i, tag;
+	struct libeth_sq_napi_stats ss = { };
+	struct libeth_cq_pp cp = {
+		.dev	= txq->dev,
+		.ss	= &ss,
+	};
+	u32 i;
 
 #ifdef HAVE_XDP_SUPPORT
 #ifdef HAVE_NETDEV_BPF_XSK_POOL
-	if (test_bit(__IDPF_Q_XDP, txq->flags) && txq->xsk_pool) {
+	if (idpf_queue_has(XDP, txq) && txq->xsk_pool) {
 		idpf_xsk_cleanup_xdpq(txq);
 		return;
 	}
@@ -309,34 +227,11 @@ static void idpf_tx_buf_rel_all(struct idpf_queue *txq)
 		return;
 
 	/* Free all the Tx buffer sk_buffs */
-	for (i = 0; i < txq->desc_count; i++)
-		idpf_tx_buf_rel(txq, &txq->tx.bufs[i]);
+	for (i = 0; i < txq->buf_pool_size; i++)
+		libeth_tx_complete(&txq->tx.bufs[i], &cp);
 
 	kfree(txq->tx.bufs);
 	txq->tx.bufs = NULL;
-
-	if (!txq->stash->buf_stack.bufs)
-		return;
-
-	/* If a TX timeout occurred, there are potentially still bufs in the
-	 * hash table, free them here.
-	 */
-	hash_for_each_safe(txq->stash->sched_buf_hash, tag, tmp, stash, hlist) {
-		if (stash) {
-			idpf_tx_buf_rel(txq, &stash->buf);
-			hash_del(&stash->hlist);
-			idpf_buf_lifo_push(&txq->stash->buf_stack, stash);
-		}
-	}
-
-	for (i = 0; i < txq->stash->buf_stack.size; i++)
-		kfree(txq->stash->buf_stack.bufs[i]);
-
-	kfree(txq->stash->buf_stack.bufs);
-	txq->stash->buf_stack.bufs = NULL;
-
-	kfree(txq->stash);
-	txq->stash = NULL;
 }
 
 /**
@@ -355,7 +250,7 @@ static void idpf_tx_desc_rel(struct idpf_queue *txq, bool bufq)
 		idpf_tx_buf_rel_all(txq);
 #ifdef HAVE_XDP_SUPPORT
 
-		if (!test_bit(__IDPF_Q_XDP, txq->flags))
+		if (!idpf_queue_has(XDP, txq))
 			netdev_tx_reset_queue(netdev_get_tx_queue(txq->vport->netdev,
 								  txq->idx));
 #elif
@@ -366,6 +261,10 @@ static void idpf_tx_desc_rel(struct idpf_queue *txq, bool bufq)
 
 	if (!txq->desc_ring)
 		return;
+
+	if (txq->tx.refillq)
+		kfree(txq->tx.refillq->ring);
+
 	dmam_free_coherent(txq->dev, txq->size, txq->desc_ring, txq->dma);
 	txq->desc_ring = NULL;
 	txq->next_to_alloc = 0;
@@ -405,35 +304,25 @@ static void idpf_tx_desc_rel_all(struct idpf_q_grp *q_grp)
  */
 static int idpf_tx_buf_alloc_all(struct idpf_queue *tx_q)
 {
-	int buf_size;
-	int i;
-
 	/* Allocate book keeping buffers only. Buffers to be supplied to HW
 	 * are allocated by kernel network stack and received as part of skb
 	 */
-	buf_size = sizeof(struct idpf_tx_buf) * tx_q->desc_count;
-	tx_q->tx.bufs = kzalloc(buf_size, GFP_KERNEL);
+	if (idpf_queue_has(FLOW_SCH_EN, tx_q)) {
+		if (idpf_is_cap_ena(tx_q->vport->adapter, IDPF_OTHER_CAPS,
+				    VIRTCHNL2_CAP_MISS_COMPL_TAG))
+			/* We lose the upper bit of the completion tag when
+			 * MISS bit is enabled, thus reducing our pool size.
+			 */
+			tx_q->buf_pool_size = U16_MAX >> 1;
+		else
+			tx_q->buf_pool_size = U16_MAX;
+	} else {
+		tx_q->buf_pool_size = tx_q->desc_count;
+	}
+	tx_q->tx.bufs = kcalloc(tx_q->buf_pool_size, sizeof(*tx_q->tx.bufs),
+				GFP_KERNEL);
 	if (!tx_q->tx.bufs)
 		return -ENOMEM;
-
-	/* Initialize tx buf stack for out-of-order completions if
-	 * flow scheduling offload is enabled
-	 */
-	tx_q->stash->buf_stack.bufs = kcalloc(tx_q->desc_count,
-					      sizeof(struct idpf_tx_stash *),
-					      GFP_KERNEL);
-	if (!tx_q->stash->buf_stack.bufs)
-		return -ENOMEM;
-
-	tx_q->stash->buf_stack.size = tx_q->desc_count;
-	tx_q->stash->buf_stack.top = tx_q->desc_count;
-
-	for (i = 0; i < tx_q->desc_count; i++) {
-		tx_q->stash->buf_stack.bufs[i] = kzalloc(sizeof(*tx_q->stash->buf_stack.bufs[i]),
-							 GFP_KERNEL);
-		if (!tx_q->stash->buf_stack.bufs[i])
-			return -ENOMEM;
-	}
 
 	return 0;
 }
@@ -448,7 +337,8 @@ static int idpf_tx_buf_alloc_all(struct idpf_queue *tx_q)
 static int idpf_tx_desc_alloc(struct idpf_queue *tx_q, bool bufq)
 {
 	struct device *dev = tx_q->dev;
-	u32 desc_sz;
+	struct idpf_sw_queue *refillq;
+	u32 desc_sz, i;
 	int err;
 
 	if (bufq) {
@@ -477,7 +367,31 @@ static int idpf_tx_desc_alloc(struct idpf_queue *tx_q, bool bufq)
 	tx_q->next_to_alloc = 0;
 	tx_q->next_to_use = 0;
 	tx_q->next_to_clean = 0;
-	set_bit(__IDPF_Q_GEN_CHK, tx_q->flags);
+	idpf_queue_set(GEN_CHK, tx_q);
+
+	if (!idpf_queue_has(FLOW_SCH_EN, tx_q) || !bufq)
+		return 0;
+
+	refillq = tx_q->tx.refillq;
+	refillq->desc_count = tx_q->buf_pool_size;
+	refillq->ring = kcalloc(refillq->desc_count, sizeof(u32), GFP_KERNEL);
+	if (!refillq->ring) {
+		err = -ENOMEM;
+		goto err_alloc;
+	}
+
+	for (i = 0; i < refillq->desc_count; i++)
+		refillq->ring[i] =
+			FIELD_PREP(IDPF_RFL_BI_BUFID_M, i) |
+			FIELD_PREP(IDPF_RFL_BI_GEN_M,
+				   idpf_queue_has(GEN_CHK, refillq));
+
+	/* Go ahead and flip the GEN bit since this counts as filling
+	 * up the ring, i.e. we already ring wrapped.
+	 */
+	idpf_queue_change(GEN_CHK, refillq);
+
+	tx_q->tx.last_re = tx_q->desc_count - IDPF_TX_SPLITQ_RE_MIN_GAP;
 
 	return 0;
 
@@ -498,13 +412,8 @@ static int idpf_tx_desc_alloc_all(struct idpf_vport *vport,
 				  struct idpf_q_grp *q_grp)
 {
 	bool is_splitq = idpf_is_queue_model_split(q_grp->txq_model);
-	u16 compl_tag_w = IDPF_TX_SPLITQ_COMPL_TAG_WIDTH;
 	int err = 0;
 	int i, j;
-
-	if (idpf_is_cap_ena(vport->adapter, IDPF_OTHER_CAPS,
-			    VIRTCHNL2_CAP_MISS_COMPL_TAG))
-		compl_tag_w = IDPF_TX_SPLITQ_COMPL_TAG_WIDTH - 1;
 
 	/* Setup buffer queues. In single queue model buffer queues and
 	 * completion queues will be same.
@@ -512,39 +421,10 @@ static int idpf_tx_desc_alloc_all(struct idpf_vport *vport,
 	for (i = 0; i < q_grp->num_txq_grp; i++) {
 		for (j = 0; j < q_grp->txq_grps[i].num_txq; j++) {
 			struct idpf_queue *txq = q_grp->txq_grps[i].txqs[j];
-			u8 gen_bits = 0;
-			u16 bufidx_mask;
 
 			err = idpf_tx_desc_alloc(txq, true);
 			if (err)
 				return err;
-
-			if (!is_splitq)
-				continue;
-
-			txq->compl_tag_cur_gen = 0;
-
-			/* Determine the number of bits in the bufid
-			 * mask and add one to get the start of the
-			 * generation bits
-			 */
-			bufidx_mask = txq->desc_count - 1;
-			while (bufidx_mask >> 1) {
-				txq->compl_tag_gen_s++;
-				bufidx_mask = bufidx_mask >> 1;
-			}
-			txq->compl_tag_gen_s++;
-
-			gen_bits = compl_tag_w - txq->compl_tag_gen_s;
-			txq->compl_tag_gen_max = GETMAXVAL(gen_bits);
-
-			/* Set bufid mask based on location of first
-			 * gen bit; it cannot simply be the descriptor
-			 * ring size-1 since we can have size values
-			 * where not all of those bits are set.
-			 */
-			txq->compl_tag_bufid_m =
-				GETMAXVAL(txq->compl_tag_gen_s);
 		}
 
 		if (!is_splitq)
@@ -728,25 +608,25 @@ static int idpf_rx_hdr_buf_alloc(struct idpf_queue *rxq)
 }
 
 /**
- * idpf_rx_post_buf_refill - Post buffer id to refill queue
+ * idpf_post_buf_refill - Post buffer id to refill queue
  * @refillq: refill queue to post to
  * @buf_id: buffer id to post
  */
-void idpf_rx_post_buf_refill(struct idpf_sw_queue *refillq, u16 buf_id)
+void idpf_post_buf_refill(struct idpf_sw_queue *refillq, u16 buf_id)
 {
-	u16 nta = refillq->next_to_alloc;
+	u32 nta = refillq->next_to_use;
 
 	/* store the buffer ID and the SW maintained GEN bit to the refillq */
 	refillq->ring[nta] =
-		FIELD_PREP(IDPF_RX_BI_BUFID_M, buf_id) |
-		FIELD_PREP(IDPF_RX_BI_GEN_M,
-			   test_bit(__IDPF_Q_GEN_CHK, refillq->flags));
+		FIELD_PREP(IDPF_RFL_BI_BUFID_M, buf_id) |
+		FIELD_PREP(IDPF_RFL_BI_GEN_M,
+			   idpf_queue_has(GEN_CHK, refillq));
 
 	if (unlikely(++nta == refillq->desc_count)) {
 		nta = 0;
-		change_bit(__IDPF_Q_GEN_CHK, refillq->flags);
+		idpf_queue_change(GEN_CHK, refillq);
 	}
-	refillq->next_to_alloc = nta;
+	refillq->next_to_use = nta;
 }
 
 /**
@@ -1024,7 +904,8 @@ static int idpf_rx_buf_alloc_all(struct idpf_q_grp *q_grp)
  */
 static int idpf_refillq_desc_alloc(struct idpf_sw_queue *refillq)
 {
-	refillq->ring = kcalloc(refillq->desc_count, sizeof(u16), GFP_KERNEL);
+	refillq->ring = kcalloc(refillq->desc_count, sizeof(*refillq->ring),
+				GFP_KERNEL);
 	if (!refillq->ring)
 		return -ENOMEM;
 
@@ -1108,6 +989,13 @@ static void idpf_txq_group_rel(struct idpf_q_grp *q_grp)
 		for (j = 0; j < txq_grp->num_txq; j++) {
 			if (!txq_grp->txqs[j])
 				continue;
+
+			if (txq_grp->txqs[j]->tx.refillq) {
+				kfree(txq_grp->txqs[j]->tx.refillq);
+				txq_grp->txqs[j]->tx.refillq = NULL;
+			}
+
+			xa_destroy(&txq_grp->txqs[j]->reinject_timers);
 
 			kfree(txq_grp->txqs[j]);
 			txq_grp->txqs[j] = NULL;
@@ -1486,7 +1374,7 @@ static int idpf_txq_group_alloc(struct idpf_vport *vport, struct idpf_q_grp *q_g
 				u16 num_txq_per_grp)
 {
 	struct idpf_adapter *adapter = vport->adapter;
-	bool flow_sch_en, miss_compl_tag_en, split;
+	bool flow_sch_en, split;
 	int i;
 
 	q_grp->txq_grps = kcalloc(q_grp->num_txq_grp,
@@ -1497,8 +1385,6 @@ static int idpf_txq_group_alloc(struct idpf_vport *vport, struct idpf_q_grp *q_g
 	split = idpf_is_queue_model_split(q_grp->txq_model);
 	flow_sch_en = !idpf_is_cap_ena(adapter, IDPF_OTHER_CAPS,
 				       VIRTCHNL2_CAP_SPLITQ_QSCHED);
-	miss_compl_tag_en = idpf_is_cap_ena(adapter, IDPF_OTHER_CAPS,
-					    VIRTCHNL2_CAP_MISS_COMPL_TAG);
 
 	for (i = 0; i < q_grp->num_txq_grp; i++) {
 		struct idpf_txq_group *tx_qgrp = &q_grp->txq_grps[i];
@@ -1547,16 +1433,16 @@ static int idpf_txq_group_alloc(struct idpf_vport *vport, struct idpf_q_grp *q_g
 			}
 
 			if (flow_sch_en) {
-				set_bit(__IDPF_Q_FLOW_SCH_EN, q->flags);
-				q->stash = kzalloc(sizeof(*q->stash),
-						   GFP_KERNEL);
-				if (!q->stash)
-					return -ENOMEM;
+				idpf_queue_set(FLOW_SCH_EN, q);
+				q->tx.refillq = kzalloc(sizeof(*q->tx.refillq),
+							GFP_KERNEL);
+				if (!q->tx.refillq)
+					goto err_alloc;
 
-				hash_init(q->stash->sched_buf_hash);
+				idpf_queue_set(GEN_CHK, q->tx.refillq);
+				idpf_queue_set(RFL_GEN_CHK, q->tx.refillq);
 
-				if (miss_compl_tag_en)
-					set_bit(__IDPF_Q_MISS_TAG_EN, q->flags);
+				xa_init(&q->reinject_timers);
 			}
 		}
 
@@ -1584,7 +1470,7 @@ static int idpf_txq_group_alloc(struct idpf_vport *vport, struct idpf_q_grp *q_g
 		tx_qgrp->complq->vport = vport;
 
 		if (flow_sch_en)
-			set_bit(__IDPF_Q_FLOW_SCH_EN, tx_qgrp->complq->flags);
+			idpf_queue_set(FLOW_SCH_EN, tx_qgrp->complq);
 	}
 
 	return 0;
@@ -1674,7 +1560,7 @@ static void __idpf_rxq_init(struct idpf_vport *vport, struct idpf_queue *q)
 		q->rx_hsplit_en = true;
 		q->rx_hbuf_size = IDPF_HDR_BUF_SIZE;
 	}
-	set_bit(__IDPF_Q_GEN_CHK, q->flags);
+	idpf_queue_set(GEN_CHK, q);
 }
 
 /**
@@ -1713,18 +1599,10 @@ static void idpf_refillq_init(struct idpf_vport *vport,
 	for (i = 0; i < q_grp->num_bufq; i++) {
 		refillq = &q_grp->refillqs[i];
 
-#ifdef CONFIG_IOMMU_BYPASS
-#ifdef CONFIG_ARM64
-		if (vport->adapter->iommu_byp.ddev)
-			refillq->dev = vport->adapter->iommu_byp.ddev;
-		else
-#endif /* CONFIG_ARM64 */
-#endif /* CONFIG_IOMMU_BYPASS */
-		refillq->dev = idpf_adapter_to_dev(vport->adapter);
 		refillq->desc_count =
 			q_grp->bufq_desc_count[i % q_grp->bufq_per_rxq];
-		set_bit(__IDPF_Q_GEN_CHK, refillq->flags);
-		set_bit(__IDPF_RFLQ_GEN_CHK, refillq->flags);
+		idpf_queue_set(GEN_CHK, refillq);
+		idpf_queue_set(RFL_GEN_CHK, refillq);
 	}
 }
 
@@ -1968,8 +1846,8 @@ int idpf_vport_queue_alloc_all(struct idpf_vport *vport,
 	 */
 	for (i = 0; i < vport->num_txq; i++) {
 		if (test_bit(i, config_data->etf_qenable)) {
-			set_bit(__IDPF_Q_FLOW_SCH_EN, vport->txqs[i]->flags);
-			set_bit(__IDPF_Q_ETF_EN, vport->txqs[i]->flags);
+			idpf_queue_set(FLOW_SCH_EN, vport->txqs[i]);
+			idpf_queue_set(ETF_EN, vport->txqs[i]);
 		}
 	}
 
@@ -1979,7 +1857,7 @@ int idpf_vport_queue_alloc_all(struct idpf_vport *vport,
 		int j;
 
 		for (j = vport->xdp_txq_offset; j < vport->num_txq; j++)
-			set_bit(__IDPF_Q_XDP, vport->txqs[j]->flags);
+			idpf_queue_set(XDP, vport->txqs[j]);
 	}
 
 #endif /* HAVE_XDP_SUPPORT */
@@ -2000,7 +1878,7 @@ static void idpf_tx_handle_sw_marker(struct idpf_queue *tx_q)
 	struct idpf_vport *vport = tx_q->vport;
 	int i;
 
-	clear_bit(__IDPF_Q_SW_MARKER, tx_q->flags);
+	idpf_queue_clear(SW_MARKER, tx_q);
 	/* Hardware must write marker packets to all queues associated with
 	 * completion queues. So check if all queues received marker packets
 	 */
@@ -2008,67 +1886,13 @@ static void idpf_tx_handle_sw_marker(struct idpf_queue *tx_q)
 		/* If we're still waiting on any other TXQ marker completions,
 		 * just return now since we cannot wake up the marker_wq yet.
 		 */
-		if (test_bit(__IDPF_Q_SW_MARKER, vport->txqs[i]->flags))
+		if (idpf_queue_has(SW_MARKER, vport->txqs[i]))
 			return;
 	}
 
 	/* Drain complete */
 	set_bit(IDPF_VPORT_SW_MARKER, vport->flags);
 	wake_up(&vport->sw_marker_wq);
-}
-
-/**
- * idpf_tx_splitq_unmap_hdr - unmap DMA buffer for header
- * @tx_q: tx queue to clean buffer from
- * @tx_buf: buffer to be cleaned
- */
-static void idpf_tx_splitq_unmap_hdr(struct idpf_queue *tx_q,
-				     struct idpf_tx_buf *tx_buf)
-{
-	/* unmap skb header data */
-	dma_unmap_single(tx_q->dev,
-			 dma_unmap_addr(tx_buf, dma),
-			 dma_unmap_len(tx_buf, len),
-			 DMA_TO_DEVICE);
-
-	dma_unmap_len_set(tx_buf, len, 0);
-}
-
-/**
- * idpf_tx_splitq_clean_hdr - Clean TX buffer resources for header portion of
- * packet
- * @tx_q: tx queue to clean buffer from
- * @tx_buf: buffer to be cleaned
- * @cleaned: pointer to stats struct to track cleaned packets/bytes
- * @napi_budget: Used to determine if we are in netpoll
- */
-static void idpf_tx_splitq_clean_hdr(struct idpf_queue *tx_q,
-				     struct idpf_tx_buf *tx_buf,
-				     struct idpf_cleaned_stats *cleaned,
-				     int napi_budget)
-{
-#ifdef HAVE_XDP_SUPPORT
-	if (test_bit(__IDPF_Q_XDP, tx_q->flags))
-#ifdef HAVE_XDP_FRAME_STRUCT
-		xdp_return_frame(tx_buf->xdpf);
-#else
-		page_frag_free(tx_buf->raw_buf);
-#endif
-	else
-		/* free the skb */
-		napi_consume_skb(tx_buf->skb, napi_budget);
-#else
-	napi_consume_skb(tx_buf->skb, napi_budget);
-#endif /* HAVE_XDP_SUPPORT */
-
-	if (dma_unmap_len(tx_buf, len))
-		idpf_tx_splitq_unmap_hdr(tx_q, tx_buf);
-
-	/* clear tx_buf data */
-	tx_buf->type = IDPF_TX_BUF_EMPTY;
-	tx_buf->nr_frags = 0;
-	cleaned->bytes += tx_buf->bytecount;
-	cleaned->packets += tx_buf->gso_segs;
 }
 
 #if IS_ENABLED(CONFIG_PTP_1588_CLOCK)
@@ -2140,186 +1964,61 @@ static void idpf_tx_read_tstamp(struct idpf_queue *txq, struct sk_buff *skb)
 }
 
 /**
- * idpf_tx_clean_stashed_bufs clean bufs that were stored for
- * out of order completions
- * @txq: queue to clean
- * @compl_tag: completion tag of packet to clean (from completion descriptor)
- * @desc_ts: pointer to 3 byte timestamp from descriptor
- * @cleaned: pointer to stats struct to track cleaned packets/bytes
- * @budget: Used to determine if we are in netpoll
- */
-static void
-idpf_tx_clean_stashed_bufs(struct idpf_queue *txq, u16 compl_tag, u8 *desc_ts,
-			   struct idpf_cleaned_stats *cleaned, int budget)
-{
-	struct idpf_tx_stash *stash;
-	struct hlist_node *tmp_buf;
-
-	/* Buffer completion */
-	hash_for_each_possible_safe(txq->stash->sched_buf_hash, stash, tmp_buf,
-				    hlist, compl_tag) {
-		if (unlikely(stash->buf.compl_tag != compl_tag))
-			continue;
-
-		hash_del(&stash->hlist);
-
-		switch (stash->buf.type) {
-		case IDPF_TX_BUF_SKB_TSTAMP:
-			if (!(skb_shinfo(stash->buf.skb)->tx_flags & SKBTX_IN_PROGRESS))
-				goto skip_tx_tstamp;
-
-			idpf_tx_read_tstamp(txq, stash->buf.skb);
-skip_tx_tstamp:
-			idpf_tx_splitq_clean_hdr(txq, &stash->buf, cleaned,
-						 budget);
-			break;
-		case IDPF_TX_BUF_SKB:
-			if (unlikely(stash->miss_pkt))
-				timer_delete(&stash->reinject_timer);
-
-			/* Fetch timestamp from completion descriptor to report
-			 * to stack.
-			 */
-			idpf_tx_hw_tstamp(txq, stash->buf.skb, desc_ts);
-
-#ifdef HAVE_XDP_SUPPORT
-			fallthrough;
-		case IDPF_TX_BUF_XDP:
-#endif /* HAVE_XDP_SUPPORT */
-#ifdef CONFIG_TX_TIMEOUT_VERBOSE
-			cleaned->hash_tbl_pkt_cleans++;
-#endif /* CONFIG_TX_TIMEOUT_VERBOSE */
-			idpf_tx_splitq_clean_hdr(txq, &stash->buf, cleaned,
-						 budget);
-			break;
-		case IDPF_TX_BUF_FRAG:
-			dma_unmap_page(txq->dev,
-				       dma_unmap_addr(&stash->buf, dma),
-				       dma_unmap_len(&stash->buf, len),
-				       DMA_TO_DEVICE);
-			dma_unmap_len_set(&stash->buf, len, 0);
-			break;
-		default:
-			break;
-		}
-
-		/* Push shadow buf back onto stack */
-		idpf_buf_lifo_push(&txq->stash->buf_stack, stash);
-	}
-}
-
-/**
- * idpf_tx_find_stashed_bufs - fetch "first" buffer for a packet with the given
- * completion tag
- * @txq: queue to clean
- * @compl_tag: completion tag of packet to clean (from completion descriptor)
- */
-static struct idpf_tx_stash *idpf_tx_find_stashed_bufs(struct idpf_queue *txq,
-						       u16 compl_tag)
-{
-	struct idpf_tx_stash *stash;
-
-	/* Buffer completion */
-	hash_for_each_possible(txq->stash->sched_buf_hash, stash, hlist, compl_tag) {
-		if (unlikely(stash->buf.compl_tag != (int)compl_tag))
-			continue;
-
-		if (stash->buf.skb)
-			return stash;
-	}
-
-	return NULL;
-}
-
-/**
  * idpf_tx_handle_reinject_expire - handler for miss completion timer
  * @timer: pointer to timer that expired
  */
 static void idpf_tx_handle_reinject_expire(struct timer_list *timer)
 {
-	struct idpf_tx_stash *stash = timer_container_of(stash, timer, reinject_timer);
-	struct idpf_cleaned_stats cleaned = { };
-	struct idpf_queue *txq = stash->txq;
+	struct idpf_reinject_timer *timer_info = timer_container_of(timer_info, timer, timer);
+	struct idpf_queue *txq = timer_info->txq;
 	struct netdev_queue *nq;
 
-	idpf_tx_clean_stashed_bufs(txq, stash->buf.compl_tag, NULL, &cleaned, 0);
+	dev_consume_skb_any(timer_info->skb);
 
 	/* Update BQL */
 	nq = netdev_get_tx_queue(txq->vport->netdev, txq->idx);
-	netdev_tx_completed_queue(nq, cleaned.packets, cleaned.bytes);
+	netdev_tx_completed_queue(nq, timer_info->gso_segs, timer_info->bytes);
 
 	u64_stats_update_begin(&txq->stats_sync);
 	u64_stats_inc(&txq->vport->port_stats.tx_reinjection_timeouts);
 	u64_stats_update_end(&txq->stats_sync);
+
+	kfree(timer_info);
 }
 
 /**
  * idpf_tx_start_reinject_timer - start timer to wait for reinject completion
  * @txq: pointer to queue struct
- * @stash: stash of packet to start timer for
+ * @tx_buf: first buffer of the packet being reinjected
+ * @compl_tag: completion tag of the packet being reinjected
+ *
+ * Return: 0 on success, negative on failure
  */
-static void idpf_tx_start_reinject_timer(struct idpf_queue *txq,
-					 struct idpf_tx_stash *stash)
+static int idpf_tx_start_reinject_timer(struct idpf_queue *txq,
+					struct idpf_tx_buf *tx_buf,
+					u32 compl_tag)
 {
-	/* Back pointer to txq so timer expire handler knows what to
-	 * clean if timer expires.
-	 */
-	stash->txq = txq;
-	stash->miss_pkt = true;
-	timer_setup(&stash->reinject_timer, idpf_tx_handle_reinject_expire, 0);
-	mod_timer(&stash->reinject_timer, jiffies + msecs_to_jiffies(4 * HZ));
-}
+	struct idpf_reinject_timer *reinject_timer;
+	int err = 0;
 
-/**
- * idpf_stash_flow_sch_buf - store buffer parameters info to be freed at a
- * later time (only relevant for flow scheduling mode)
- * @txq: Tx queue to clean
- * @tx_buf: buffer to store
- * @compl_type: type of completion, determines what extra steps need to be
- * taken when stashing, such as starting the reinject timer on a miss
- * completion. Only IDPF_TXD_COMPLT_RULE_MISS and IDPF_TXD_COMPLT_REINJECTED
- * are relevant
- */
-static int idpf_stash_flow_sch_buf(struct idpf_queue *txq,
-				   struct idpf_tx_buf *tx_buf,
-				   u8 compl_type)
-{
-	struct idpf_tx_stash *stash;
-
-	if (unlikely(!tx_buf->type))
-		return 0;
-
-	stash = idpf_buf_lifo_pop(&txq->stash->buf_stack);
-	if (unlikely(!stash)) {
-		net_err_ratelimited("%s: No out-of-order TX buffers left!\n",
-				    txq->vport->netdev->name);
+	reinject_timer = kzalloc(sizeof(*reinject_timer), GFP_ATOMIC);
+	if (!reinject_timer)
 		return -ENOMEM;
-	}
 
-	/* Store buffer params in shadow buffer */
-	stash->buf.skb = tx_buf->skb;
-	stash->buf.bytecount = tx_buf->bytecount;
-	stash->buf.gso_segs = tx_buf->gso_segs;
-	stash->buf.type = tx_buf->type;
-	stash->buf.nr_frags = tx_buf->nr_frags;
-	dma_unmap_addr_set(&stash->buf, dma, dma_unmap_addr(tx_buf, dma));
-	dma_unmap_len_set(&stash->buf, len, dma_unmap_len(tx_buf, len));
-	stash->buf.compl_tag = tx_buf->compl_tag;
+	reinject_timer->txq = txq;
+	reinject_timer->skb = tx_buf->skb;
+	reinject_timer->bytes = tx_buf->bytes;
+	reinject_timer->gso_segs = tx_buf->packets;
 
-	if (unlikely(compl_type == IDPF_TXD_COMPLT_RULE_MISS))
-		idpf_tx_start_reinject_timer(txq, stash);
-	else if (unlikely(compl_type == IDPF_TXD_COMPLT_REINJECTED))
-		stash->miss_pkt = true;
-	else
-		stash->miss_pkt = false;
+	timer_setup(&reinject_timer->timer, idpf_tx_handle_reinject_expire, 0);
+	mod_timer(&reinject_timer->timer, jiffies + msecs_to_jiffies(4 * HZ));
 
-	/* Add buffer to buf_hash table to be freed later */
-	hash_add(txq->stash->sched_buf_hash, &stash->hlist, stash->buf.compl_tag);
+	err = xa_err(xa_store(&txq->reinject_timers, compl_tag,
+			      reinject_timer, GFP_ATOMIC));
+	if (err)
+		kfree(reinject_timer);
 
-	tx_buf->type = IDPF_TX_BUF_EMPTY;
-	tx_buf->nr_frags = 0;
-
-	return 0;
+	return err;
 }
 
 #define idpf_tx_splitq_clean_bump_ntc(txq, ntc, desc, buf)	\
@@ -2342,7 +2041,6 @@ do {								\
  * @cleaned: pointer to stats struct to track cleaned packets/bytes
  * @descs_only: true if queue is using flow-based scheduling and should
  * not clean buffers at this time
- * @compl_type: type of completion, forwarded to stash function
  *
  * Cleans the queue descriptor ring. If the queue is using queue-based
  * scheduling, the buffers will be cleaned as well. If the queue is using
@@ -2350,31 +2048,28 @@ do {								\
  * Separate packet completion events will be reported on the completion queue,
  * and the buffers will be cleaned separately. The stats are not updated from
  * this function when using flow-based scheduling.
- *
- * Furthermore, in flow scheduling mode, check to make sure there are enough
- * reserve buffers to stash the packet. If there are not, return early, which
- * will leave next_to_clean pointing to the packet that failed to be stashed.
- * Return false in this scenario. Otherwise, return true.
  */
-static bool
-idpf_tx_splitq_clean(struct idpf_queue *tx_q, u16 end, int napi_budget,
-		     struct idpf_cleaned_stats *cleaned, bool descs_only,
-		     u8 compl_type)
+static void idpf_tx_splitq_clean(struct idpf_queue *tx_q, u16 end,
+				 int napi_budget,
+				 struct libeth_sq_napi_stats *cleaned,
+				 bool descs_only)
 {
 	union idpf_tx_flex_desc *next_pending_desc = NULL;
 	union idpf_tx_flex_desc *tx_desc;
 	u16 ntc = tx_q->next_to_clean;
+	struct libeth_cq_pp cp = {
+		.dev	= tx_q->dev,
+		.ss	= cleaned,
+		.napi	= !!napi_budget,
+	};
 	struct idpf_tx_buf *tx_buf;
-	bool clean_complete = true;
-#ifdef CONFIG_TX_TIMEOUT_VERBOSE
-	int rs_compl = 0, re_compl = 1;
 
-	if (unlikely(compl_type == IDPF_TXD_COMPLT_RS)) {
-		rs_compl = 1;
-		re_compl = 0;
+	if (descs_only) {
+		/* Bump ring index to mark as cleaned. */
+		tx_q->next_to_clean = end;
+		return;
 	}
 
-#endif /* CONFIG_TX_TIMEOUT_VERBOSE */
 	tx_desc = IDPF_FLEX_TX_DESC(tx_q, ntc);
 	next_pending_desc = IDPF_FLEX_TX_DESC(tx_q, end);
 	tx_buf = &tx_q->tx.bufs[ntc];
@@ -2386,278 +2081,132 @@ idpf_tx_splitq_clean(struct idpf_queue *tx_q, u16 end, int napi_budget,
 		 * it's corresponding entry in the buffer ring is reserved.  We
 		 * can skip this descriptor since there is no buffer to clean.
 		 */
-		if (tx_buf->type == IDPF_TX_BUF_RSVD)
+		if (tx_buf->type == LIBETH_SQE_CTX)
 			goto fetch_next_txq_desc;
 
-		eop_idx = tx_buf->eop_idx;
+		eop_idx = tx_buf->rs_idx;
+		libeth_tx_complete(tx_buf, &cp);
 
-		if (descs_only) {
-#ifdef CONFIG_TX_TIMEOUT_VERBOSE
-			if (unlikely(tx_buf->type != IDPF_TX_BUF_SKB &&
-				     tx_buf->type != IDPF_TX_BUF_XDP))
-				cleaned->re_invalid_first_buf++;
-#endif /* CONFIG_TX_TIMEOUT_VERBOSE */
+		/* unmap remaining buffers */
+		while (ntc != eop_idx) {
+			idpf_tx_splitq_clean_bump_ntc(tx_q, ntc,
+						      tx_desc, tx_buf);
 
-			if (IDPF_TX_BUF_RSV_UNUSED(tx_q) < tx_buf->nr_frags) {
-				clean_complete = false;
-#ifdef CONFIG_TX_TIMEOUT_VERBOSE
-				cleaned->ooo_compl_stash_fail += rs_compl;
-				cleaned->re_pkt_stash_fail += re_compl;
-#endif /* CONFIG_TX_TIMEOUT_VERBOSE */
-				goto tx_splitq_clean_out;
-			}
-
-			idpf_stash_flow_sch_buf(tx_q, tx_buf, compl_type);
-#ifdef CONFIG_TX_TIMEOUT_VERBOSE
-			cleaned->ooo_compl_stash += rs_compl;
-			cleaned->re_pkt_stash += re_compl;
-#endif /* CONFIG_TX_TIMEOUT_VERBOSE */
-
-			while (ntc != eop_idx) {
-				idpf_tx_splitq_clean_bump_ntc(tx_q, ntc,
-							      tx_desc, tx_buf);
-
-				if (!tx_buf->type)
-					continue;
-
-				idpf_stash_flow_sch_buf(tx_q, tx_buf, compl_type);
-			}
-		} else {
-			idpf_tx_splitq_clean_hdr(tx_q, tx_buf, cleaned, napi_budget);
-
-			/* unmap remaining buffers */
-			while (ntc != eop_idx) {
-				idpf_tx_splitq_clean_bump_ntc(tx_q, ntc,
-							      tx_desc, tx_buf);
-
-				/* unmap any remaining paged data */
-				if (tx_buf->type == IDPF_TX_BUF_FRAG) {
-					dma_unmap_page(tx_q->dev,
-						       dma_unmap_addr(tx_buf, dma),
-						       dma_unmap_len(tx_buf, len),
-						       DMA_TO_DEVICE);
-					dma_unmap_len_set(tx_buf, len, 0);
-				}
-			}
-
+			/* unmap any remaining paged data */
+			libeth_tx_complete(tx_buf, &cp);
 		}
 
 fetch_next_txq_desc:
 		idpf_tx_splitq_clean_bump_ntc(tx_q, ntc, tx_desc, tx_buf);
 	}
 
-tx_splitq_clean_out:
 	tx_q->next_to_clean = ntc;
-
-	return clean_complete;
 }
 
-#define idpf_tx_clean_buf_ring_bump_ntc(txq, ntc, buf)	\
-do {							\
-	(buf)++;					\
-	(ntc)++;					\
-	if (unlikely((ntc) == (txq)->desc_count)) {	\
-		buf = (txq)->tx.bufs;			\
-		ntc = 0;				\
-	}						\
-} while (0)
-
 /**
- * idpf_tx_clean_buf_ring - clean flow scheduling TX queue buffers
+ * idpf_tx_clean_bufs - clean flow scheduling TX queue buffers
  * @txq: queue to clean
- * @compl_tag: completion tag of packet to clean (from completion descriptor)
+ * @buf_id: packet's starting buffer ID, from completion descriptor
  * @cleaned: pointer to stats struct to track cleaned packets/bytes
  * @desc_ts: pointer to 3 byte timestamp from descriptor
  * @budget: Used to determine if we are in netpoll
  *
- * Cleans all buffers for a single packet associated with the input completion
- * tag from the TX buffer ring. If an out-of-order completion is received,
- * packets prior to the given completion tag packet will be stashed in the hash
- * table if possible. Returns the byte/segment count for the cleaned packet
- * associated this completion tag.
+ * Clean all buffers associated with the packet starting at buf_id. Returns the
+ * byte/segment count for the cleaned packet.
  */
-static bool idpf_tx_clean_buf_ring(struct idpf_queue *txq, u16 compl_tag,
-				   struct idpf_cleaned_stats *cleaned,
-				   u8 *desc_ts, int budget)
+static void idpf_tx_clean_bufs(struct idpf_queue *txq, u16 buf_id,
+			       struct libeth_sq_napi_stats *cleaned,
+			       u8 *desc_ts, int budget)
 {
-	u16 idx = compl_tag & txq->compl_tag_bufid_m;
-	u16 ntc, eop_idx, orig_idx = idx;
-	struct idpf_tx_buf *tx_buf;
+	struct idpf_tx_buf *tx_buf = NULL;
+	struct libeth_cq_pp cp = {
+		.dev	= txq->dev,
+		.ss	= cleaned,
+		.napi	= !!budget,
+	};
 
-	tx_buf = &txq->tx.bufs[idx];
-
-	if (unlikely(tx_buf->compl_tag != compl_tag))
-		return false;
-
-	switch (tx_buf->type) {
-	case IDPF_TX_BUF_SKB_TSTAMP:
-		if (!(skb_shinfo(tx_buf->skb)->tx_flags & SKBTX_IN_PROGRESS))
-			goto skip_tx_tstamp;
-
-		idpf_tx_read_tstamp(txq, tx_buf->skb);
-skip_tx_tstamp:
-		eop_idx = tx_buf->eop_idx;
-		idpf_tx_splitq_clean_hdr(txq, tx_buf, cleaned, budget);
-		break;
-	case IDPF_TX_BUF_SKB:
-		/* fetch timestamp from completion
-		 * descriptor to report to stack
+	tx_buf = &txq->tx.bufs[buf_id];
+	if (tx_buf->type == LIBETH_SQE_SKB) {
+		/* fetch timestamp from completion descriptor to report to
+		 * stack.
 		 */
 		idpf_tx_hw_tstamp(txq, tx_buf->skb, desc_ts);
+	} else if (tx_buf->type == (enum libeth_sqe_type)LIBETH_SQE_SKB_TSTAMP) {
+		if (skb_shinfo(tx_buf->skb)->tx_flags & SKBTX_IN_PROGRESS)
+			idpf_tx_read_tstamp(txq, tx_buf->skb);
 
-#ifdef HAVE_XDP_SUPPORT
-		fallthrough;
-	case IDPF_TX_BUF_XDP:
-#endif /* HAVE_XDP_SUPPORT */
-		eop_idx = tx_buf->eop_idx;
-		idpf_tx_splitq_clean_hdr(txq, tx_buf, cleaned, budget);
-		break;
-	default:
-#ifdef CONFIG_TX_TIMEOUT_VERBOSE
-		cleaned->rs_invalid_first_buf++;
-#endif /* CONFIG_TX_TIMEOUT_VERBOSE */
-		return false;
+		tx_buf->type = LIBETH_SQE_SKB;
+	} else if (tx_buf->type != LIBETH_SQE_XDP_TX) {
+		return;
 	}
 
-#ifdef CONFIG_TX_TIMEOUT_VERBOSE
-	cleaned->ring_pkt_cleans++;
-#endif /* CONFIG_TX_TIMEOUT_VERBOSE */
-	while (idx != eop_idx) {
-		idpf_tx_clean_buf_ring_bump_ntc(txq, idx, tx_buf);
+	libeth_tx_complete(tx_buf, &cp);
+	idpf_post_buf_refill(txq->tx.refillq, buf_id);
 
-		if (tx_buf->type == IDPF_TX_BUF_FRAG) {
-			dma_unmap_page(txq->dev,
-				       dma_unmap_addr(tx_buf, dma),
-				       dma_unmap_len(tx_buf, len),
-				       DMA_TO_DEVICE);
-			dma_unmap_len_set(tx_buf, len, 0);
-		}
+	while (idpf_tx_buf_next(tx_buf) != IDPF_TXBUF_NULL) {
+		buf_id = idpf_tx_buf_next(tx_buf);
 
-		tx_buf->type = IDPF_TX_BUF_EMPTY;
+		tx_buf = &txq->tx.bufs[buf_id];
+		libeth_tx_complete(tx_buf, &cp);
+		idpf_post_buf_refill(txq->tx.refillq, buf_id);
 	}
-
-	/* It's possible the packet we just cleaned was an out of order
-	 * completion, which means we can we can stash the buffers starting
-	 * from the original next_to_clean and reuse the descriptors. We need
-	 * to compare the descriptor ring next_to_clean packet's "first" buffer
-	 * to the "first" buffer of the packet we just cleaned to determine if
-	 * this is the case. Howevever, next_to_clean can point to either a
-	 * reserved buffer that corresponds to a context descriptor used for the
-	 * next_to_clean packet (TSO packet) or the "first" buffer (single
-	 * packet). The orig_idx from the packet we just cleaned will always
-	 * point to the "first" buffer. If next_to_clean points to a reserved
-	 * buffer, let's bump ntc once and start the comparison from there.
-	 */
-	ntc = txq->next_to_clean;
-	tx_buf = &txq->tx.bufs[ntc];
-	while (tx_buf->type == IDPF_TX_BUF_RSVD)
-		idpf_tx_clean_buf_ring_bump_ntc(txq, ntc, tx_buf);
-
-	if (tx_buf == &txq->tx.bufs[orig_idx] ||
-	    (tx_buf->type != IDPF_TX_BUF_SKB && tx_buf->type != IDPF_TX_BUF_XDP))
-		goto update_ntc_out;
-
-	/* If ntc still points to a different "first" buffer, clean the
-	 * descriptor ring and stash all of the buffers for later cleaning. If
-	 * we cannot stash all of the buffers, next_to_clean will point to the
-	 * "first" buffer of the packet that could not be stashed and cleaning
-	 * will start there next time.
-	 */
-	if (unlikely(!idpf_tx_splitq_clean(txq, orig_idx, budget, cleaned,
-					   true, IDPF_TXD_COMPLT_RS)))
-		goto clean_buf_ring_out;
-
-	/* Otherwise, bump idx to point to the start of the next packet and
-	 * update next_to_clean to reflect the cleaning that was done above.
-	 */
-update_ntc_out:
-	idpf_tx_clean_buf_ring_bump_ntc(txq, idx, tx_buf);
-	txq->next_to_clean = idx;
-
-clean_buf_ring_out:
-	return true;
 }
 
 /**
- * idpf_tx_handle_miss_completion
+ * idpf_tx_handle_miss_completion - handle packet on the exception path
  * @txq: Tx ring to clean
  * @desc: pointer to completion queue descriptor to extract completion
  * information from
  * @cleaned: pointer to stats struct to track cleaned packets/bytes
- * @budget: Used to determine if we are in netpoll
  * @compl_tag: unique completion tag of packet
+ * @budget: Used to determine if we are in netpoll
  *
- * Determines where the packet is located, the hash table or the ring. If the
- * packet is on the ring, the ring cleaning function will take care of freeing
- * the DMA buffers and stash the SKB. The stashing function, called inside the
- * ring cleaning function, will take care of starting the timer.
+ * Handle a miss completion which signals the packet is taking the execption
+ * path. In the usual flow, the miss completion signals the start of expection
+ * path processing. Upon receiving a miss completion, we can unmap all buffers
+ * associated with the packet, but hold on to the skb. We expect a reinject
+ * completion, but it is not guaranteed, so we will start a timer to make sure
+ * the skb is freed in a reasonable amount of time (before a Tx timeout is
+ * triggered by the stack).
  *
- * If packet is already in the hashtable, determine if we need to finish up the
- * reinject completion or start the timer to wait for the reinject completion.
+ * If the timer cannot be started, we will clean this packet as if it were an
+ * RS completion and the reinject completion will be ignored.
  *
- * Returns cleaned bytes/packets only if we're finishing up the reinject
- * completion and freeing the skb. Otherwise, the stats are 0 / irrelevant
+ * In the rare case the reinject completion is processed first (due to a rare
+ * timing situation with an LSO packet primarily), the miss completion is the
+ * end of the exception path handling and we finish cleaning the packet
+ * normally. Note: we set it to the skb type to include DMA unmapping as part
+ * of the cleaning.
+ *
+ * Cleaned bytes/packets are only relevant if we're finishing up the reinject
+ * completion and freeing the skb. Otherwise, the stats are 0 / irrelevant.
  */
 static void
 idpf_tx_handle_miss_completion(struct idpf_queue *txq,
 			       struct idpf_splitq_tx_compl_desc *desc,
-			       struct idpf_cleaned_stats *cleaned,
+			       struct libeth_sq_napi_stats *cleaned,
 			       u16 compl_tag, int budget)
 {
-	struct idpf_tx_stash *stash;
+	struct idpf_tx_buf *tx_buf = &txq->tx.bufs[compl_tag];
 
-	/* First determine if this packet was already stashed */
-	stash = idpf_tx_find_stashed_bufs(txq, compl_tag);
-	if (!stash) {
-		u16 idx = compl_tag & txq->compl_tag_bufid_m;
-		struct idpf_tx_buf *tx_buf;
-
-		tx_buf = &txq->tx.bufs[idx];
-
-		if (unlikely(tx_buf->type == IDPF_TX_BUF_MISS)) {
-			/* In the unlikely event we received the reinject
-			 * completion first AND it failed to be stashed to the
-			 * hash table, the packet is still be on the ring.  No
-			 * other completion is expected for this packet, so
-			 * clean it normally. Reset the buf type field to SKB
-			 * to trigger the full cleaning in the call to
-			 * idpf_tx_clean_buf_ring below.
-			 */
-			tx_buf->type = IDPF_TX_BUF_SKB;
-		} else {
-			/* Otherwise, since we received a miss completion
-			 * first, we free all of the buffers, but cannot free
-			 * the skb or update the stack BQL yet. Stash the skb
-			 * and start the timer to wait for the reinject
-			 * completion.
-			 */
-			idpf_tx_splitq_unmap_hdr(txq, tx_buf);
-			idpf_stash_flow_sch_buf(txq, tx_buf,
-						IDPF_TXD_COMPLT_RULE_MISS);
-			/* Reset buf type to use clean_buf_ring routine to clean
-			 * remaining buffers. It will be set to empty there.
-			 */
-			tx_buf->type = IDPF_TX_BUF_MISS;
-		}
-
-		idpf_tx_clean_buf_ring(txq, compl_tag, cleaned, desc->ts,
-				       budget);
-	} else {
-		if (stash->miss_pkt)
-			/* If it was previously stashed because
-			 * of a reinject completion, we can go
-			 * ahead and clean everything up
-			 */
-			idpf_tx_clean_stashed_bufs(txq, compl_tag, desc->ts,
-						   cleaned, budget);
-		else
-			/* If it was previously stashed because
-			 * of an RE completion, we just need to
-			 * start the timer while we wait for
-			 * the reinject completion
-			 */
-			idpf_tx_start_reinject_timer(txq, stash);
+	if (unlikely(tx_buf->type == (enum libeth_sqe_type)LIBETH_SQE_REINJECT)) {
+		/* Reinject completion was received first. No other completion
+		 * is expected for this packet, clean it normally.
+		 */
+		tx_buf->type = LIBETH_SQE_SKB;
+		goto clean_pkt;
 	}
+
+	if (idpf_tx_start_reinject_timer(txq, tx_buf, compl_tag)) {
+		netdev_err(txq->netdev,
+			   "Failed to start reinject timer, BQL may be inaccurate.\n");
+		goto clean_pkt;
+	}
+
+	tx_buf->type = (enum libeth_sqe_type)LIBETH_SQE_MISS;
+
+clean_pkt:
+	idpf_tx_clean_bufs(txq, compl_tag, cleaned, desc->ts, budget);
 }
 
 /**
@@ -2674,43 +2223,35 @@ idpf_tx_handle_miss_completion(struct idpf_queue *txq,
 static void
 idpf_tx_handle_rs_completion(struct idpf_queue *txq,
 			     struct idpf_splitq_tx_compl_desc *desc,
-			     struct idpf_cleaned_stats *cleaned,
+			     struct libeth_sq_napi_stats *cleaned,
 			     int budget)
 {
-	u16 compl_tag;
+	/* RS completion contains queue head for queue based scheduling or
+	 * completion tag for flow based scheduling.
+	 */
+	u16 rs_compl_val = le16_to_cpu(desc->q_head_compl_tag.q_head);
 
-	if (!test_bit(__IDPF_Q_FLOW_SCH_EN, txq->flags)) {
-		u16 head = le16_to_cpu(desc->q_head_compl_tag.q_head);
+	if (!idpf_queue_has(FLOW_SCH_EN, txq))
+		return idpf_tx_splitq_clean(txq, rs_compl_val, budget, cleaned,
+					    false);
 
-		idpf_tx_splitq_clean(txq, head, budget, cleaned, false,
-				     IDPF_TXD_COMPLT_RS);
-
-		return;
-	}
-
-	compl_tag = le16_to_cpu(desc->q_head_compl_tag.compl_tag);
 	/* Check for miss completion in tag if enabled */
-	if (unlikely(test_bit(__IDPF_Q_MISS_TAG_EN, txq->flags) &&
-		     compl_tag & IDPF_TX_SPLITQ_MISS_COMPL_TAG)) {
-		compl_tag &= ~IDPF_TX_SPLITQ_MISS_COMPL_TAG;
+	if (unlikely(idpf_queue_has(MISS_TAG_EN, txq) &&
+		     rs_compl_val & IDPF_TX_SPLITQ_MISS_COMPL_TAG)) {
+		rs_compl_val &= ~IDPF_TX_SPLITQ_MISS_COMPL_TAG;
 
 		return idpf_tx_handle_miss_completion(txq, desc, cleaned,
-						      compl_tag, budget);
+						      rs_compl_val, budget);
 	}
 #ifdef HAVE_XDP_SUPPORT
 #ifdef HAVE_NETDEV_BPF_XSK_POOL
 
 	if (txq->xsk_pool)
-		return idpf_tx_splitq_clean_zc(txq, compl_tag, cleaned);
+		return idpf_tx_splitq_clean_zc(txq, rs_compl_val, cleaned);
 #endif /* HAVE_NETDEV_BPF_XSK_POOL */
 #endif /* HAVE_XDP_SUPPORT */
 
-	/* If we didn't clean anything on the ring, this packet must be
-	 * in the hash table. Go clean it there.
-	 */
-	if (!idpf_tx_clean_buf_ring(txq, compl_tag, cleaned, desc->ts, budget))
-		idpf_tx_clean_stashed_bufs(txq, compl_tag, desc->ts, cleaned,
-					   budget);
+	idpf_tx_clean_bufs(txq, rs_compl_val, cleaned, desc->ts, budget);
 }
 
 /**
@@ -2724,63 +2265,58 @@ idpf_tx_handle_rs_completion(struct idpf_queue *txq,
 static void
 idpf_tx_handle_reinject_completion(struct idpf_queue *txq,
 				   struct idpf_splitq_tx_compl_desc *desc,
-				   struct idpf_cleaned_stats *cleaned,
+				   struct libeth_sq_napi_stats *cleaned,
 				   int budget)
 {
 	u16 compl_tag = le16_to_cpu(desc->q_head_compl_tag.compl_tag);
-	struct idpf_tx_stash *stash;
+	struct idpf_tx_buf *tx_buf = &txq->tx.bufs[compl_tag];
+	struct idpf_reinject_timer *reinject_timer;
+	struct libeth_cq_pp cp = {
+		.dev	= txq->dev,
+		.ss	= cleaned,
+		.napi	= !!budget,
+	};
 
-	/* First check if the packet has already been stashed because of a miss
-	 * completion
-	 */
-	stash = idpf_tx_find_stashed_bufs(txq, compl_tag);
-	if (stash) {
-		if (stash->miss_pkt)
-			/* If it was previously stashed because of a miss
-			 * completion, we can go ahead and clean everything up
+	if (tx_buf->type == (enum libeth_sqe_type)LIBETH_SQE_MISS) {
+		reinject_timer = xa_erase(&txq->reinject_timers, compl_tag);
+		if (unlikely(!reinject_timer))
+			/* Either timer expired or we failed to create the
+			 * timer.  In either case, nothing more to do since SKB
+			 * has already been consumed.
 			 */
-			idpf_tx_clean_stashed_bufs(txq, compl_tag, desc->ts,
-						   cleaned, budget);
-		else
-			/* If it was previously stashed because of a RE or out
-			 * of order RS completion, it means we received the
-			 * reinject completion before the miss completion.
-			 * However, since the packet did take the miss path, it
-			 * is guaranteed to get a miss completion. Therefore,
-			 * mark it as a miss path packet in the hash table so
-			 * it will be cleaned upon receiving the miss
-			 * completion.
-			 */
-			stash->miss_pkt = true;
-	} else {
-		u16 idx = compl_tag & txq->compl_tag_bufid_m;
-		struct idpf_tx_buf *tx_buf;
+			return;
+
+		timer_delete(&reinject_timer->timer);
+		kfree(reinject_timer);
+
+		/* Reset type to REINJECT to consume skb and update stats. */
+		tx_buf->type = (enum libeth_sqe_type)LIBETH_SQE_REINJECT;
+		libeth_tx_complete(tx_buf, &cp);
+	} else if (tx_buf->type == LIBETH_SQE_SKB) {
 		u16 next_pkt_idx;
 
-		/* If it was not in the hash table, the packet is still on the
-		 * ring.  This is another scenario in which the reinject
-		 * completion arrives before the miss completion.  We can
-		 * simply stash all of the buffers associated with this packet
-		 * and any buffers on the ring prior to it.  We will clean the
-		 * packet and all of its buffers associated with this
-		 * completion tag upon receiving the miss completion, and clean
-		 * the others upon receiving their respective RS completions.
+		/* This is a scenario in which the reinject completion arrives
+		 * before the miss completion.  We can simply move the
+		 * descriptor ring next_to_clean to after this packet since we
+		 * know all descriptors up to this point have been read by HW.
+		 * We will clean the packet and all of its buffers associated
+		 * with this completion tag upon receiving the miss completion,
+		 * and clean the others upon receiving their respective RS
+		 * completions.
 		 */
-		tx_buf = &txq->tx.bufs[idx];
-		tx_buf->type = IDPF_TX_BUF_MISS;
+		tx_buf->type = (enum libeth_sqe_type)LIBETH_SQE_REINJECT;
 
-		next_pkt_idx = tx_buf->eop_idx + 1;
+		next_pkt_idx = tx_buf->rs_idx + 1;
 		if (unlikely(next_pkt_idx >= txq->desc_count))
 			next_pkt_idx = 0;
 
-		idpf_tx_splitq_clean(txq, next_pkt_idx, budget, cleaned, true,
-				     IDPF_TXD_COMPLT_REINJECTED);
+		txq->next_to_clean = next_pkt_idx;
 	}
 
-	/* If the packet is not in the ring or hash table, it means we either
-	 * received a regular completion already or the timer expired on the
-	 * miss completion.  In either case, everything should already be
-	 * cleaned up and we should ignore this completion.
+	/* If we get here with this tag, it means we either received a regular
+	 * completion already or the timer expired on the miss completion.  In
+	 * either case, everything should already be cleaned up and we should
+	 * ignore this completion.
 	 */
 }
 
@@ -2817,7 +2353,7 @@ static bool idpf_tx_clean_complq(struct idpf_queue *complq, int budget,
 	ntc -= complq->desc_count;
 
 	do {
-		struct idpf_cleaned_stats cleaned_stats = { };
+		struct libeth_sq_napi_stats cleaned_stats = { };
 		u16 hw_head, compl_tag;
 		int rel_tx_qid;
 		u8 ctype;	/* completion type */
@@ -2826,7 +2362,7 @@ static bool idpf_tx_clean_complq(struct idpf_queue *complq, int budget,
 		/* if the descriptor isn't done, no work yet to do */
 		gen = le16_get_bits(tx_desc->qid_comptype_gen,
 				    IDPF_TXD_COMPLQ_GEN_M);
-		if (test_bit(__IDPF_Q_GEN_CHK, complq->flags) != gen)
+		if (idpf_queue_has(GEN_CHK, complq) != gen)
 			break;
 
 		/* Find necessary info of TX queue to clean buffers */
@@ -2848,8 +2384,7 @@ static bool idpf_tx_clean_complq(struct idpf_queue *complq, int budget,
 			hw_head = le16_to_cpu(tx_desc->q_head_compl_tag.q_head);
 
 			idpf_tx_splitq_clean(tx_q, hw_head, budget,
-					     &cleaned_stats, true,
-					     IDPF_TXD_COMPLT_RE);
+					     &cleaned_stats, true);
 			break;
 		case IDPF_TXD_COMPLT_RS:
 			idpf_tx_handle_rs_completion(tx_q, tx_desc,
@@ -2881,24 +2416,6 @@ static bool idpf_tx_clean_complq(struct idpf_queue *complq, int budget,
 		u64_stats_update_begin(&tx_q->stats_sync);
 		u64_stats_add(&tx_q->q_stats.tx.packets, cleaned_stats.packets);
 		u64_stats_add(&tx_q->q_stats.tx.bytes, cleaned_stats.bytes);
-#ifdef CONFIG_TX_TIMEOUT_VERBOSE
-		u64_stats_add(&tx_q->q_stats.tx.hash_tbl_pkt_cleans,
-			      cleaned_stats.hash_tbl_pkt_cleans);
-		u64_stats_add(&tx_q->q_stats.tx.ring_pkt_cleans,
-			      cleaned_stats.ring_pkt_cleans);
-		u64_stats_add(&tx_q->q_stats.tx.re_pkt_stash,
-			      cleaned_stats.re_pkt_stash);
-		u64_stats_add(&tx_q->q_stats.tx.re_pkt_stash_fail,
-			      cleaned_stats.re_pkt_stash_fail);
-		u64_stats_add(&tx_q->q_stats.tx.ooo_compl_stash,
-			      cleaned_stats.ooo_compl_stash);
-		u64_stats_add(&tx_q->q_stats.tx.ooo_compl_stash_fail,
-			      cleaned_stats.ooo_compl_stash_fail);
-		u64_stats_add(&tx_q->q_stats.tx.re_invalid_first_buf,
-			      cleaned_stats.re_invalid_first_buf);
-		u64_stats_add(&tx_q->q_stats.tx.rs_invalid_first_buf,
-			      cleaned_stats.rs_invalid_first_buf);
-#endif /* CONFIG_TX_TIMEOUT_VERBOSE */
 		tx_q->cleaned_pkts += cleaned_stats.packets;
 		tx_q->cleaned_bytes += cleaned_stats.bytes;
 		complq->tx.num_completions++;
@@ -2910,7 +2427,7 @@ fetch_next_desc:
 		if (unlikely(!ntc)) {
 			ntc -= complq->desc_count;
 			tx_desc = IDPF_SPLITQ_TX_COMPLQ_DESC(complq, 0);
-			change_bit(__IDPF_Q_GEN_CHK, complq->flags);
+			idpf_queue_change(GEN_CHK, complq);
 		}
 
 		prefetch(tx_desc);
@@ -2941,7 +2458,7 @@ fetch_next_desc:
 		tx_q = complq->txq_grp->txqs[i];
 
 #ifdef HAVE_XDP_SUPPORT
-		if (test_bit(__IDPF_Q_XDP, tx_q->flags)) {
+		if (idpf_queue_has(XDP, tx_q)) {
 #ifdef HAVE_NETDEV_BPF_XSK_POOL
 			/* In splitq implementation we do not track Tx
 			 * descriptors.  Instead, we know the Tx completion
@@ -2989,7 +2506,6 @@ fetch_next_desc:
 		/* Check if the TXQ needs to and can be restarted */
 		if (unlikely(netif_tx_queue_stopped(nq) && complq_ok &&
 			     netif_carrier_ok(tx_q->vport->netdev) &&
-			     !IDPF_TX_BUF_RSV_LOW(tx_q) &&
 			     (IDPF_DESC_UNUSED(tx_q) >= IDPF_TX_WAKE_THRESH))) {
 			/* Make sure any other threads stopping queue after
 			 * this see new next_to_clean.
@@ -3058,15 +2574,21 @@ void idpf_tx_splitq_build_flow_desc(union idpf_tx_flex_desc *desc,
 	desc->flow.qw1.ts[2] = params->offload.desc_ts[2];
 }
 
-/* Global conditions to tell whether the txq (and related resources)
- * has room to allow the use of "size" descriptors.
+/**
+ * idpf_tx_splitq_has_room - check if enough Tx splitq resources are available
+ * @tx_q: the queue to be checked
+ * @descs_needed: number of descriptors required for this packet
+ * @bufs_needed: number of Tx buffers required for this packet
+ *
+ * Return: 0 if no room available, 1 otherwise
  */
-static int idpf_txq_has_room(struct idpf_queue *tx_q, u32 size)
+static int idpf_txq_has_room(struct idpf_queue *tx_q, u32 descs_needed,
+			     u32 bufs_needed)
 {
-	if (IDPF_DESC_UNUSED(tx_q) < size ||
+	if (IDPF_DESC_UNUSED(tx_q) < descs_needed ||
 	    IDPF_TX_COMPLQ_PENDING(tx_q->txq_grp) >
 		IDPF_TX_COMPLQ_OVERFLOW_THRESH(tx_q->txq_grp->complq) ||
-	    IDPF_TX_BUF_RSV_LOW(tx_q))
+	    idpf_tx_splitq_get_free_bufs(tx_q->tx.refillq) < bufs_needed)
 		return 0;
 	return 1;
 }
@@ -3075,14 +2597,21 @@ static int idpf_txq_has_room(struct idpf_queue *tx_q, u32 size)
  * idpf_tx_maybe_stop_splitq - 1st level check for Tx splitq stop conditions
  * @tx_q: the queue to be checked
  * @descs_needed: number of descriptors required for this packet
+ * @bufs_needed: number of buffers needed for this packet
  *
  * Return: 0 if stop is not needed
  */
 static int idpf_tx_maybe_stop_splitq(struct idpf_queue *tx_q,
-				     unsigned int descs_needed)
+				     u32 descs_needed,
+				     u32 bufs_needed)
 {
+	/* Since we have multiple resources to check for splitq, our
+	 * start,stop_thrs becomes a boolean check instead of a count
+	 * threshold.
+	 */
 	if (netif_subqueue_maybe_stop(tx_q->netdev, tx_q->idx,
-				      idpf_txq_has_room(tx_q, descs_needed),
+				      idpf_txq_has_room(tx_q, descs_needed,
+							bufs_needed),
 				      1, 1))
 		return 0;
 
@@ -3094,8 +2623,6 @@ static int idpf_tx_maybe_stop_splitq(struct idpf_queue *tx_q,
 	if (IDPF_TX_COMPLQ_PENDING(tx_q->txq_grp) >
 	    IDPF_TX_COMPLQ_OVERFLOW_THRESH(tx_q->txq_grp->complq))
 		u64_stats_inc(&tx_q->q_stats.tx.busy_too_many_pend_compl);
-	if (IDPF_TX_BUF_RSV_LOW(tx_q))
-		u64_stats_inc(&tx_q->q_stats.tx.busy_low_rsv_bufs);
 #endif /* CONFIG_TX_TIMEOUT_VERBOSE */
 	u64_stats_update_end(&tx_q->stats_sync);
 
@@ -3141,120 +2668,16 @@ void idpf_tx_buf_hw_update(struct idpf_queue *tx_q, u32 val,
 }
 
 /**
- * __idpf_chk_linearize - Check skb is not using too many buffers
- * @skb: send buffer
- * @max_bufs: maximum number of buffers
- *
- * For TSO we need to count the TSO header and segment payload separately.  As
- * such we need to check cases where we have max_bufs-1 fragments or more as we
- * can potentially require max_bufs+1 DMA transactions, 1 for the TSO header, 1
- * for the segment payload in the first descriptor, and another max_buf-1 for
- * the fragments.
- */
-static bool __idpf_chk_linearize(struct sk_buff *skb, unsigned int max_bufs)
-{
-	const struct skb_shared_info *shinfo = skb_shinfo(skb);
-	const skb_frag_t *frag, *stale;
-	int nr_frags, sum;
-
-	/* no need to check if number of frags is less than max_bufs - 1 */
-	nr_frags = shinfo->nr_frags;
-	if (nr_frags < (max_bufs - 1))
-		return false;
-
-	/* We need to walk through the list and validate that each group
-	 * of max_bufs-2 fragments totals at least gso_size.
-	 */
-	nr_frags -= max_bufs - 2;
-	frag = &shinfo->frags[0];
-
-	/* Initialize size to the negative value of gso_size minus 1.  We use
-	 * this as the worst case scenario in which the frag ahead of us only
-	 * provides one byte which is why we are limited to max_bufs-2
-	 * descriptors for a single transmit as the header and previous
-	 * fragment are already consuming 2 descriptors.
-	 */
-	sum = 1 - shinfo->gso_size;
-
-	/* Add size of frags 0 through 4 to create our initial sum */
-	sum += skb_frag_size(frag++);
-	sum += skb_frag_size(frag++);
-	sum += skb_frag_size(frag++);
-	sum += skb_frag_size(frag++);
-	sum += skb_frag_size(frag++);
-
-	/* Walk through fragments adding latest fragment, testing it, and
-	 * then removing stale fragments from the sum.
-	 */
-	for (stale = &shinfo->frags[0];; stale++) {
-		int stale_size = skb_frag_size(stale);
-
-		sum += skb_frag_size(frag++);
-
-		/* The stale fragment may present us with a smaller
-		 * descriptor than the actual fragment size. To account
-		 * for that we need to remove all the data on the front and
-		 * figure out what the remainder would be in the last
-		 * descriptor associated with the fragment.
-		 */
-		if (stale_size > IDPF_TX_MAX_DESC_DATA) {
-			int align_pad = -(skb_frag_off(stale)) &
-					(IDPF_TX_MAX_READ_REQ_SIZE - 1);
-
-			sum -= align_pad;
-			stale_size -= align_pad;
-
-			do {
-				sum -= IDPF_TX_MAX_DESC_DATA_ALIGNED;
-				stale_size -= IDPF_TX_MAX_DESC_DATA_ALIGNED;
-			} while (stale_size > IDPF_TX_MAX_DESC_DATA);
-		}
-
-		/* if sum is negative we failed to make sufficient progress */
-		if (sum < 0)
-			return true;
-
-		if (!nr_frags--)
-			break;
-
-		sum -= stale_size;
-	}
-
-	return false;
-}
-
-/**
- * idpf_chk_linearize - Check if skb exceeds max descriptors per packet
- * @skb: send buffer
- * @max_bufs: maximum scatter gather buffers for single packet
- * @count: number of buffers this packet needs
- *
- * Make sure we don't exceed maximum scatter gather buffers for a single
- * packet. We have to do some special checking around the boundary (max_bufs-1)
- * if TSO is on since we need count the TSO header and payload separately.
- * E.g.: a packet with 7 fragments can require 9 DMA transactions; 1 for TSO
- * header, 1 for segment payload, and then 7 for the fragments.
- */
-bool idpf_chk_linearize(struct sk_buff *skb, unsigned int max_bufs,
-			unsigned int count)
-{
-	if (likely(count < max_bufs))
-		return false;
-	if (skb_is_gso(skb))
-		return __idpf_chk_linearize(skb, max_bufs);
-
-	return count > max_bufs;
-}
-
-/**
  * idpf_tx_desc_count_required - calculate number of Tx descriptors needed
  * @txq: queue to send buffer on
  * @skb: send buffer
+ * @bufs_needed: (output) number of buffers needed for this skb.
  *
- * Returns number of data descriptors needed for this skb.
+ * Return: number of data descriptors and buffers needed for this skb.
  */
-unsigned int idpf_tx_desc_count_required(struct idpf_queue *txq,
-					 struct sk_buff *skb)
+unsigned int idpf_tx_res_count_required(struct idpf_queue *txq,
+					struct sk_buff *skb,
+					u32 *bufs_needed)
 {
 	const struct skb_shared_info *shinfo;
 	unsigned int count = 0, i;
@@ -3265,6 +2688,7 @@ unsigned int idpf_tx_desc_count_required(struct idpf_queue *txq,
 		return count;
 
 	shinfo = skb_shinfo(skb);
+	*bufs_needed += shinfo->nr_frags;
 	for (i = 0; i < shinfo->nr_frags; i++) {
 		unsigned int size;
 
@@ -3294,50 +2718,6 @@ unsigned int idpf_tx_desc_count_required(struct idpf_queue *txq,
 }
 
 /**
- * idpf_tx_dma_map_error - handle TX DMA map errors
- * @txq: queue to send buffer on
- * @skb: send buffer
- * @first: original first buffer info buffer for packet
- * @idx: starting point on ring to unwind
- */
-void idpf_tx_dma_map_error(struct idpf_queue *txq, struct sk_buff *skb,
-			   struct idpf_tx_buf *first, u16 idx)
-{
-	u64_stats_update_begin(&txq->stats_sync);
-	u64_stats_inc(&txq->q_stats.tx.dma_map_errs);
-	u64_stats_update_end(&txq->stats_sync);
-
-	for (;;) {
-		struct idpf_tx_buf *tx_buf;
-
-		tx_buf = &txq->tx.bufs[idx];
-		idpf_tx_buf_rel(txq, tx_buf);
-		if (tx_buf == first)
-			break;
-		if (idx == 0)
-			idx = txq->desc_count;
-		idx--;
-	}
-
-	if (skb_is_gso(skb)) {
-		union idpf_tx_flex_desc *tx_desc;
-
-		/* If we failed a DMA mapping for a TSO packet, we will have
-		 * used one additional descriptor for a context descriptor.
-		 * Reset that here.
-		 */
-		tx_desc = IDPF_FLEX_TX_DESC(txq, idx);
-		memset(tx_desc, 0, sizeof(union idpf_flex_tx_ctx_desc));
-		if (idx == 0)
-			idx = txq->desc_count;
-		idx--;
-	}
-
-	/* Update tail in case netdev_xmit_more was previously true */
-	idpf_tx_buf_hw_update(txq, idx, false);
-}
-
-/**
  * idpf_tx_splitq_bump_ntu - adjust NTU and generation
  * @txq: the tx ring to wrap
  * @ntu: ring index to bump
@@ -3347,12 +2727,50 @@ static inline unsigned int idpf_tx_splitq_bump_ntu(struct idpf_queue *txq,
 {
 	ntu++;
 
-	if (ntu == txq->desc_count) {
+	if (ntu == txq->desc_count)
 		ntu = 0;
-		txq->compl_tag_cur_gen = IDPF_TX_ADJ_COMPL_TAG_GEN(txq);
-	}
 
 	return ntu;
+}
+
+/**
+ * idpf_tx_splitq_pkt_err_unmap - Unmap buffers and bump tail in case of error
+ * @txq: Tx queue to unwind
+ * @params: pointer to splitq params struct
+ * @first: starting buffer for packet to unmap
+ */
+static void idpf_tx_splitq_pkt_err_unmap(struct idpf_queue *txq,
+					 struct idpf_tx_splitq_params *params,
+					 struct idpf_tx_buf *first)
+{
+	struct idpf_sw_queue *refillq = txq->tx.refillq;
+	struct libeth_sq_napi_stats ss = { };
+	struct idpf_tx_buf *tx_buf = first;
+	struct libeth_cq_pp cp = {
+		.dev    = txq->dev,
+		.ss     = &ss,
+	};
+
+	u64_stats_update_begin(&txq->stats_sync);
+	u64_stats_inc(&txq->q_stats.tx.dma_map_errs);
+	u64_stats_update_end(&txq->stats_sync);
+
+	libeth_tx_complete(tx_buf, &cp);
+	while (idpf_tx_buf_next(tx_buf) != IDPF_TXBUF_NULL) {
+		tx_buf = &txq->tx.bufs[idpf_tx_buf_next(tx_buf)];
+		libeth_tx_complete(tx_buf, &cp);
+	}
+
+	/* Update tail in case netdev_xmit_more was previously true. */
+	idpf_tx_buf_hw_update(txq, params->prev_ntu, false);
+
+	if (!refillq)
+		return;
+
+	/* Restore refillq state to avoid leaking tags. */
+	if (params->prev_refill_gen != idpf_queue_has(RFL_GEN_CHK, refillq))
+		idpf_queue_change(RFL_GEN_CHK, refillq);
+	refillq->next_to_clean = params->prev_refill_ntc;
 }
 
 /**
@@ -3376,6 +2794,7 @@ static void idpf_tx_splitq_map(struct idpf_queue *tx_q,
 	struct netdev_queue *nq;
 	struct sk_buff *skb;
 	skb_frag_t *frag;
+	u32 next_buf_id;
 	u16 td_cmd = 0;
 	dma_addr_t dma;
 
@@ -3391,19 +2810,19 @@ static void idpf_tx_splitq_map(struct idpf_queue *tx_q,
 	dma = dma_map_single(tx_q->dev, skb->data, size, DMA_TO_DEVICE);
 
 	tx_buf = first;
-
-	params->compl_tag =
-		(tx_q->compl_tag_cur_gen << tx_q->compl_tag_gen_s) | i;
+	first->nr_frags = 0;
 
 	for (frag = &skb_shinfo(skb)->frags[0];; frag++) {
 		unsigned int max_data = IDPF_TX_MAX_DESC_DATA_ALIGNED;
 
-		if (dma_mapping_error(tx_q->dev, dma))
-			return idpf_tx_dma_map_error(tx_q, skb, first, i);
+		if (unlikely(dma_mapping_error(tx_q->dev, dma))) {
+			idpf_tx_buf_next(tx_buf) = IDPF_TXBUF_NULL;
+			return idpf_tx_splitq_pkt_err_unmap(tx_q, params,
+							    first);
+		}
 
 		first->nr_frags++;
-		tx_buf->compl_tag = params->compl_tag;
-		tx_buf->type = IDPF_TX_BUF_FRAG;
+		tx_buf->type = LIBETH_SQE_FRAG;
 
 		/* record length, and DMA address */
 		dma_unmap_len_set(tx_buf, len, size);
@@ -3458,27 +2877,11 @@ static void idpf_tx_splitq_map(struct idpf_queue *tx_q,
 						  max_data);
 
 			if (unlikely(++i == tx_q->desc_count)) {
-				tx_buf = tx_q->tx.bufs;
 				tx_desc = IDPF_FLEX_TX_DESC(tx_q, 0);
 				i = 0;
-				tx_q->compl_tag_cur_gen =
-					IDPF_TX_ADJ_COMPL_TAG_GEN(tx_q);
 			} else {
-				tx_buf++;
 				tx_desc++;
 			}
-
-			/* Since this packet has a buffer that is going to span
-			 * multiple descriptors, it's going to leave holes in
-			 * to the TX buffer ring. To ensure these holes do not
-			 * cause issues in the cleaning routines, we will clear
-			 * them of any stale data and assign them the same
-			 * completion tag as the current packet. Then when the
-			 * packet is being cleaned, the cleaning routines will
-			 * simply pass over these holes and finish cleaning the
-			 * rest of the packet.
-			 */
-			tx_buf->type = IDPF_TX_BUF_EMPTY;
 
 			/* Adjust the DMA offset and the remaining size of the
 			 * fragment.  On the first iteration of this loop,
@@ -3504,14 +2907,24 @@ static void idpf_tx_splitq_map(struct idpf_queue *tx_q,
 		idpf_tx_splitq_build_desc(tx_desc, params, td_cmd, size);
 
 		if (unlikely(++i == tx_q->desc_count)) {
-			tx_buf = tx_q->tx.bufs;
 			tx_desc = IDPF_FLEX_TX_DESC(tx_q, 0);
 			i = 0;
-			tx_q->compl_tag_cur_gen = IDPF_TX_ADJ_COMPL_TAG_GEN(tx_q);
 		} else {
-			tx_buf++;
 			tx_desc++;
 		}
+
+		if (idpf_queue_has(FLOW_SCH_EN, tx_q)) {
+			if (unlikely(!idpf_tx_get_free_buf_id(tx_q->tx.refillq,
+							      &next_buf_id))) {
+				idpf_tx_buf_next(tx_buf) = IDPF_TXBUF_NULL;
+				return idpf_tx_splitq_pkt_err_unmap(tx_q, params,
+								    first);
+			}
+		} else {
+			next_buf_id = i;
+		}
+		idpf_tx_buf_next(tx_buf) = next_buf_id;
+		tx_buf = &tx_q->tx.bufs[next_buf_id];
 
 		size = skb_frag_size(frag);
 		data_len -= size;
@@ -3523,12 +2936,13 @@ static void idpf_tx_splitq_map(struct idpf_queue *tx_q,
 	/* record SW timestamp if HW timestamp is not available */
 	skb_tx_timestamp(skb);
 
-	first->type = IDPF_TX_BUF_SKB;
+	first->type = LIBETH_SQE_SKB;
 	if (params->offload.tx_flags & IDPF_TX_FLAGS_TSYN)
-		first->type = IDPF_TX_BUF_SKB_TSTAMP;
+		first->type = (enum libeth_sqe_type)LIBETH_SQE_SKB_TSTAMP;
 
 	/* write last descriptor with RS and EOP bits */
-	first->eop_idx = i;
+	first->rs_idx = i;
+	idpf_tx_buf_next(tx_buf) = IDPF_TXBUF_NULL;
 	td_cmd |= params->eop_cmd;
 	idpf_tx_splitq_build_desc(tx_desc, params, td_cmd, size);
 	i = idpf_tx_splitq_bump_ntu(tx_q, i);
@@ -3537,7 +2951,7 @@ static void idpf_tx_splitq_map(struct idpf_queue *tx_q,
 
 	/* record bytecount for BQL */
 	nq = netdev_get_tx_queue(tx_q->vport->netdev, tx_q->idx);
-	netdev_tx_sent_queue(nq, first->bytecount);
+	netdev_tx_sent_queue(nq, first->bytes);
 
 	idpf_tx_buf_hw_update(tx_q, i, netdev_xmit_more());
 }
@@ -3723,11 +3137,11 @@ void idpf_tx_extra_counters(struct idpf_queue *txq, struct idpf_tx_buf *tx_buf,
 #ifdef NETIF_F_GSO_UDP_L4
 		if (skb_shinfo(skb)->gso_type & SKB_GSO_UDP_L4)
 			u64_stats_add(&extra_stats->tx_udp_segs,
-				      tx_buf->gso_segs);
+				      tx_buf->packets);
 		else
 #endif /* NETIF_F_GSO_UDP_L4 */
 			u64_stats_add(&extra_stats->tx_tcp_segs,
-				      tx_buf->gso_segs);
+				      tx_buf->packets);
 	}
 	u64_stats_update_end(&txq->vport->port_stats.stats_sync);
 }
@@ -3745,8 +3159,6 @@ idpf_tx_splitq_get_ctx_desc(struct idpf_queue *txq)
 {
 	union idpf_flex_tx_ctx_desc *desc;
 	int i = txq->next_to_use;
-
-	txq->tx.bufs[i].type = IDPF_TX_BUF_RSVD;
 
 	/* grab the next descriptor */
 	desc = IDPF_FLEX_TX_CTX_DESC(txq, i);
@@ -3876,15 +3288,18 @@ static void idpf_tx_prepare_vlan_tag(struct idpf_queue *tx_q,
 static netdev_tx_t idpf_tx_splitq_frame(struct sk_buff *skb,
 					struct idpf_queue *tx_q)
 {
-	struct idpf_tx_splitq_params tx_params = { };
+	struct idpf_tx_splitq_params tx_params = {
+		.prev_ntu = tx_q->next_to_use,
+	};
 	int vlan_tag = skb_vlan_tag_present(skb);
 	union idpf_flex_tx_ctx_desc *ctx_desc;
 	struct idpf_tx_buf *first;
-	unsigned int count;
+	u32 count, buf_count = 1;
+	u32 buf_id;
 	int tso;
 	int idx;
 
-	count = idpf_tx_desc_count_required(tx_q, skb);
+	count = idpf_tx_res_count_required(tx_q, skb, &buf_count);
 	if (unlikely(!count))
 		return idpf_tx_drop_skb(tx_q, skb);
 
@@ -3894,7 +3309,7 @@ static netdev_tx_t idpf_tx_splitq_frame(struct sk_buff *skb,
 
 	/* Check for splitq specific TX resources */
 	count += tso + vlan_tag;
-	if (idpf_tx_maybe_stop_splitq(tx_q, count)) {
+	if (idpf_tx_maybe_stop_splitq(tx_q, count, buf_count)) {
 		idpf_tx_buf_hw_update(tx_q, tx_q->next_to_use, false);
 		return NETDEV_TX_BUSY;
 	}
@@ -3937,44 +3352,49 @@ static netdev_tx_t idpf_tx_splitq_frame(struct sk_buff *skb,
 		idpf_tx_set_tstamp_desc(ctx_desc, idx);
 	}
 
-	/* record the location of the first descriptor for this packet */
-	first = &tx_q->tx.bufs[tx_q->next_to_use];
-	first->skb = skb;
-
-	if (tso) {
-		first->gso_segs = tx_params.offload.tso_segs;
-		first->bytecount = skb->len +
-			(first->gso_segs - 1) * tx_params.offload.tso_hdr_len;
-	} else {
-		first->gso_segs = 1;
-		first->bytecount = max_t(unsigned int, skb->len, ETH_ZLEN);
-	}
-
-#ifdef IDPF_ADD_PROBES
-	idpf_tx_extra_counters(tx_q, first, &tx_params.offload);
-
-#endif /* IDPF_ADD_PROBES */
-	if (test_bit(__IDPF_Q_FLOW_SCH_EN, tx_q->flags)) {
-		if (unlikely(test_bit(__IDPF_Q_ETF_EN, tx_q->flags)))
+	if (idpf_queue_has(FLOW_SCH_EN, tx_q)) {
+		struct idpf_sw_queue *refillq = tx_q->tx.refillq;
+		if (unlikely(idpf_queue_has(ETF_EN, tx_q)))
 			idpf_get_flow_sche_tstamp(skb, tx_q, &tx_params.offload);
+
+		/* Save refillq state in case of a packet rollback.  Otherwise,
+		 * the tags will be leaked since they will be popped from the
+		 * refillq but never reposted during cleaning.
+		 */
+		tx_params.prev_refill_gen =
+			idpf_queue_has(RFL_GEN_CHK, refillq);
+		tx_params.prev_refill_ntc = refillq->next_to_clean;
+
+		if (unlikely(!idpf_tx_get_free_buf_id(tx_q->tx.refillq,
+						      &buf_id))) {
+			if (tx_params.prev_refill_gen !=
+			    idpf_queue_has(RFL_GEN_CHK, refillq))
+				idpf_queue_change(RFL_GEN_CHK, refillq);
+			refillq->next_to_clean = tx_params.prev_refill_ntc;
+
+			tx_q->next_to_use = tx_params.prev_ntu;
+			return idpf_tx_drop_skb(tx_q, skb);
+		}
+		tx_params.compl_tag = buf_id;
 
 		tx_params.dtype = IDPF_TX_DESC_DTYPE_FLEX_FLOW_SCHE;
 		tx_params.eop_cmd = IDPF_TXD_FLEX_FLOW_CMD_EOP;
-		/* Set the RE bit to catch any packets that may have not been
-		 * stashed during RS completion cleaning. MIN_GAP is set to
-		 * MIN_RING size to ensure it will be set at least once each
-		 * time around the ring.
+		/* Set the RE bit to periodically "clean" the descriptor ring.
+		 * MIN_GAP is set to MIN_RING size to ensure it will be set at
+		 * least once each time around the ring.
 		 */
 		if (idpf_tx_splitq_need_re(tx_q)) {
 			tx_params.eop_cmd |= IDPF_TXD_FLEX_FLOW_CMD_RE;
-			tx_q->tx.last_re = tx_q->next_to_use;
 			tx_q->txq_grp->num_completions_pending++;
+			tx_q->tx.last_re = tx_q->next_to_use;
 		}
 
 		if (skb->ip_summed == CHECKSUM_PARTIAL)
 			tx_params.offload.td_cmd |= IDPF_TXD_FLEX_FLOW_CMD_CS_EN;
 
 	} else {
+		buf_id = tx_q->next_to_use;
+
 		tx_params.dtype = IDPF_TX_DESC_DTYPE_FLEX_L2TAG1_L2TAG2;
 		tx_params.eop_cmd = IDPF_TXD_LAST_DESC_CMD;
 
@@ -3982,6 +3402,22 @@ static netdev_tx_t idpf_tx_splitq_frame(struct sk_buff *skb,
 			tx_params.offload.td_cmd |= IDPF_TX_FLEX_DESC_CMD_CS_EN;
 	}
 
+	first = &tx_q->tx.bufs[buf_id];
+	first->skb = skb;
+
+	if (tso) {
+		first->packets = tx_params.offload.tso_segs;
+		first->bytes = skb->len +
+			((first->packets - 1) * tx_params.offload.tso_hdr_len);
+	} else {
+		first->packets = 1;
+		first->bytes = max_t(unsigned int, skb->len, ETH_ZLEN);
+	}
+
+#ifdef IDPF_ADD_PROBES
+	idpf_tx_extra_counters(tx_q, first, &tx_params.offload);
+
+#endif /* IDPF_ADD_PROBES */
 	idpf_tx_splitq_map(tx_q, &tx_params, first);
 
 	return NETDEV_TX_OK;
@@ -4177,6 +3613,9 @@ static void idpf_rx_csum(struct idpf_queue *rxq, struct sk_buff *skb,
 	if (csum_bits->l4e)
 		goto checksum_fail;
 
+#ifdef IDPF_ADD_PROBES
+	u64_stats_update_begin(&port_stats->stats_sync);
+#endif /* IDPF_ADD_PROBES */
 	/* Only report checksum unnecessary for ICMP, TCP, UDP, or SCTP */
 	switch (decoded->inner_prot) {
 	case IDPF_RX_PTYPE_INNER_PROT_ICMP:
@@ -4188,25 +3627,27 @@ static void idpf_rx_csum(struct idpf_queue *rxq, struct sk_buff *skb,
 			skb->csum = csum_unfold((__force __sum16)~swab16(csum));
 			skb->ip_summed = CHECKSUM_COMPLETE;
 #ifdef IDPF_ADD_PROBES
-			u64_stats_update_begin(&port_stats->stats_sync);
 			u64_stats_inc(&port_stats->extra_stats.rx_csum_complete);
-			u64_stats_update_end(&port_stats->stats_sync);
 #endif /* IDPF_ADD_PROBES */
 		} else {
 			skb->ip_summed = CHECKSUM_UNNECESSARY;
 #ifdef IDPF_ADD_PROBES
-			u64_stats_update_begin(&port_stats->stats_sync);
 			u64_stats_inc(&port_stats->extra_stats.rx_csum_unnecessary);
-			u64_stats_update_end(&port_stats->stats_sync);
 #endif /* IDPF_ADD_PROBES */
 		}
 		break;
 	case IDPF_RX_PTYPE_INNER_PROT_SCTP:
 		skb->ip_summed = CHECKSUM_UNNECESSARY;
+#ifdef IDPF_ADD_PROBES
+		u64_stats_inc(&port_stats->extra_stats.rx_csum_unnecessary);
+#endif /* IDPF_ADD_PROBES */
 		break;
 	default:
 		break;
 	}
+#ifdef IDPF_ADD_PROBES
+	u64_stats_update_end(&port_stats->stats_sync);
+#endif /* IDPF_ADD_PROBES */
 
 	return;
 
@@ -4756,32 +4197,28 @@ static void idpf_rx_splitq_recycle_buf(struct idpf_queue *rxq,
  * @dma:       Address of DMA buffer used for XDP TX.
  * @idx:       Index of the TX buffer in the queue.
  * @size:      Size of data to be transmitted.
+ * @tx_params:  Pointer to TX parameters structure.
  */
 void idpf_prepare_xdp_tx_splitq_desc(struct idpf_queue *xdpq, dma_addr_t dma,
-				     u16 idx, u32 size)
+				     u16 idx, u32 size,
+				     struct idpf_tx_splitq_params *tx_params)
 {
-	struct idpf_tx_splitq_params tx_params = { };
 	union idpf_tx_flex_desc *tx_desc;
 
 	tx_desc = IDPF_FLEX_TX_DESC(xdpq, idx);
 	tx_desc->q.buf_addr = cpu_to_le64(dma);
 
-	tx_params.compl_tag =
-		(xdpq->compl_tag_cur_gen << xdpq->compl_tag_gen_s) | idx;
-
-	if (unlikely(test_bit(__IDPF_Q_FLOW_SCH_EN, xdpq->flags))) {
-		tx_params.dtype = IDPF_TX_DESC_DTYPE_FLEX_FLOW_SCHE;
-		tx_params.eop_cmd = IDPF_TXD_FLEX_FLOW_CMD_EOP;
+	if (unlikely(idpf_queue_has(FLOW_SCH_EN, xdpq))) {
+		tx_params->dtype = IDPF_TX_DESC_DTYPE_FLEX_FLOW_SCHE;
+		tx_params->eop_cmd = IDPF_TXD_FLEX_FLOW_CMD_EOP;
 	} else {
-		tx_params.dtype = IDPF_TX_DESC_DTYPE_FLEX_L2TAG1_L2TAG2;
-		tx_params.eop_cmd = IDPF_TXD_LAST_DESC_CMD;
+		tx_params->dtype = IDPF_TX_DESC_DTYPE_FLEX_L2TAG1_L2TAG2;
+		tx_params->eop_cmd = IDPF_TXD_LAST_DESC_CMD;
 	}
 
-	idpf_tx_splitq_build_desc(tx_desc, &tx_params,
-				  tx_params.eop_cmd | tx_params.offload.td_cmd,
+	idpf_tx_splitq_build_desc(tx_desc, tx_params,
+				  tx_params->eop_cmd | tx_params->offload.td_cmd,
 				  size);
-
-	xdpq->tx.bufs[idx].compl_tag = tx_params.compl_tag;
 }
 
 /**
@@ -4795,10 +4232,12 @@ int idpf_xmit_xdpq(struct xdp_frame *xdp, struct idpf_queue *xdpq)
 int idpf_xmit_xdpq(struct xdp_buff *xdp, struct idpf_queue *xdpq)
 #endif
 {
+	struct idpf_tx_splitq_params tx_params = { };
 	u16 ntu = xdpq->next_to_use;
 	struct idpf_tx_buf *tx_buf;
 	dma_addr_t dma;
 	void *data;
+	u32 buf_id;
 	u32 size;
 
 	if (unlikely(!xdp))
@@ -4818,14 +4257,28 @@ int idpf_xmit_xdpq(struct xdp_buff *xdp, struct idpf_queue *xdpq)
 	if (dma_mapping_error(xdpq->dev, dma))
 		return IDPF_XDP_CONSUMED;
 
-	tx_buf = &xdpq->tx.bufs[ntu];
-	tx_buf->bytecount = size;
-	tx_buf->gso_segs = 1;
+	if (unlikely(idpf_queue_has(FLOW_SCH_EN, xdpq))) {
+		/* Xdp only uses a single buffer. No need to save refillq state
+		 * for rollback like we do in the standard data path.
+		 */
+		if (unlikely(!idpf_tx_get_free_buf_id(xdpq->tx.refillq,
+						      &buf_id)))
+			return IDPF_XDP_CONSUMED;
+
+		tx_params.compl_tag = buf_id;
+	} else {
+		buf_id = ntu;
+	}
+
+	tx_buf = &xdpq->tx.bufs[buf_id];
+	tx_buf->bytes = size;
+	tx_buf->packets = 1;
 #ifdef HAVE_XDP_FRAME_STRUCT
 	tx_buf->xdpf = xdp;
 #else
-	tx_buf->raw_buf = data;
+	tx_buf->raw = data;
 #endif
+	idpf_tx_buf_compl_tag(&xdpq->tx.bufs[buf_id]) = tx_params.compl_tag;
 
 	/* record length, and DMA address */
 	dma_unmap_len_set(tx_buf, len, size);
@@ -4835,9 +4288,9 @@ int idpf_xmit_xdpq(struct xdp_buff *xdp, struct idpf_queue *xdpq)
 	INDIRECT_CALL_2(xdpq->vport->xdp_prepare_tx_desc,
 			idpf_prepare_xdp_tx_splitq_desc,
 			idpf_prepare_xdp_tx_singleq_desc,
-			xdpq, dma, ntu, size);
+			xdpq, dma, ntu, size, &tx_params);
 #else
-	xdpq->vport->xdp_prepare_tx_desc(xdpq, dma, ntu, size);
+	xdpq->vport->xdp_prepare_tx_desc(xdpq, dma, ntu, size, &tx_params);
 #endif /* HAVE_INDIRECT_CALL_WRAPPER_HEADER */
 
 	/* Make certain all of the status bits have been updated
@@ -4849,8 +4302,8 @@ int idpf_xmit_xdpq(struct xdp_buff *xdp, struct idpf_queue *xdpq)
 	xdpq->xdp_tx_active++;
 #endif /* HAVE_NETDEV_BPF_XSK_POOL */
 
-	tx_buf->type = IDPF_TX_BUF_XDP;
-	tx_buf->eop_idx = ntu;
+	tx_buf->type = LIBETH_SQE_XDP_TX;
+	tx_buf->rs_idx = ntu;
 	xdpq->next_to_use = idpf_tx_splitq_bump_ntu(xdpq, ntu);
 
 	return IDPF_XDP_TX;
@@ -4885,7 +4338,7 @@ int idpf_xdp_xmit(struct net_device *dev, struct xdp_buff *xdp)
 	int err;
 #endif /* HAVE_XDP_FRAME_STRUCT */
 
-	if (!np->active)
+	if (!test_bit(IDPF_VPORT_UP, np->state))
 		return -ENETDOWN;
 	if (unlikely(!netif_carrier_ok(dev) || !vport->link_up))
 		return -ENETDOWN;
@@ -4932,7 +4385,7 @@ void idpf_xdp_flush(struct net_device *dev)
 	unsigned int queue_index = smp_processor_id();
 	struct idpf_vport *vport = np->vport;
 
-	if (!np->active)
+	if (!test_bit(IDPF_VPORT_UP, np->state))
 		return;
 
 	if (!idpf_xdp_is_prog_ena(vport) || queue_index >= vport->num_xdp_txq)
@@ -5087,7 +4540,7 @@ static int idpf_rx_splitq_clean(struct idpf_queue *rxq, int budget)
 		gen_id = le16_get_bits(rx_desc->pktlen_gen_bufq_id,
 				       VIRTCHNL2_RX_FLEX_DESC_ADV_GEN_M);
 
-		if (test_bit(__IDPF_Q_GEN_CHK, rxq->flags) != gen_id)
+		if (idpf_queue_has(GEN_CHK, rxq) != gen_id)
 			break;
 
 		rxdid = FIELD_GET(VIRTCHNL2_RX_FLEX_DESC_ADV_RXDID_M,
@@ -5160,7 +4613,7 @@ bypass_hsplit:
 			total_rx_bytes += pkt_len;
 			total_rx_pkts++;
 			idpf_rx_splitq_recycle_buf(rxq, rx_buf);
-			idpf_rx_post_buf_refill(refillq, buf_id);
+			idpf_post_buf_refill(refillq, buf_id);
 			ntc = idpf_rx_bump_ntc(rxq, ntc);
 			continue;
 		}
@@ -5186,7 +4639,7 @@ bypass_hsplit:
 
 		if (rx_buf)
 			idpf_rx_splitq_recycle_buf(rxq, rx_buf);
-		idpf_rx_post_buf_refill(refillq, buf_id);
+		idpf_post_buf_refill(refillq, buf_id);
 
 		ntc = idpf_rx_bump_ntc(rxq, ntc);
 		/* skip if it is non EOP desc */
@@ -5244,7 +4697,7 @@ bypass_hsplit:
  *
  * Return 0 on success and negative on failure.
  */
-static int idpf_rx_update_bufq_desc(struct idpf_queue *bufq, u16 refill_desc,
+static int idpf_rx_update_bufq_desc(struct idpf_queue *bufq, u32 refill_desc,
 				    struct virtchnl2_splitq_rx_buf_desc *buf_desc)
 {
 	struct idpf_page_info *pinfo;
@@ -5252,7 +4705,7 @@ static int idpf_rx_update_bufq_desc(struct idpf_queue *bufq, u16 refill_desc,
 	u16 buf_id;
 	u32 offset;
 
-	buf_id = FIELD_GET(IDPF_RX_BI_BUFID_M, refill_desc);
+	buf_id = FIELD_GET(IDPF_RFL_BI_BUFID_M, refill_desc);
 
 	buf = &bufq->rx.bufs[buf_id];
 	pinfo = &buf->page_info[buf->page_indx];
@@ -5301,7 +4754,7 @@ static void idpf_rx_clean_refillq(struct idpf_queue *bufq,
 {
 	struct virtchnl2_splitq_rx_buf_desc *buf_desc;
 	u16 bufq_nta = bufq->next_to_alloc;
-	u16 ntc = refillq->next_to_clean;
+	u32 ntc = refillq->next_to_clean;
 	int cleaned = 0;
 	u16 gen;
 
@@ -5309,11 +4762,11 @@ static void idpf_rx_clean_refillq(struct idpf_queue *bufq,
 
 	/* make sure we stop at ring wrap in the unlikely case ring is full */
 	while (likely(cleaned < refillq->desc_count)) {
-		u16 refill_desc = IDPF_SPLITQ_RX_BI_DESC(refillq, ntc);
+		u32 refill_desc = IDPF_SPLITQ_RX_BI_DESC(refillq, ntc);
 		bool failure;
 
-		gen = FIELD_GET(IDPF_RX_BI_GEN_M, refill_desc);
-		if (test_bit(__IDPF_RFLQ_GEN_CHK, refillq->flags) != gen)
+		gen = FIELD_GET(IDPF_RFL_BI_GEN_M, refill_desc);
+		if (idpf_queue_has(RFL_GEN_CHK, refillq) != gen)
 			break;
 
 		failure = idpf_rx_update_bufq_desc(bufq, refill_desc,
@@ -5322,7 +4775,7 @@ static void idpf_rx_clean_refillq(struct idpf_queue *bufq,
 			break;
 
 		if (unlikely(++ntc == refillq->desc_count)) {
-			change_bit(__IDPF_RFLQ_GEN_CHK, refillq->flags);
+			idpf_queue_change(RFL_GEN_CHK, refillq);
 			ntc = 0;
 		}
 
@@ -6006,8 +5459,8 @@ static int idpf_vport_splitq_napi_poll(struct napi_struct *napi, int budget)
 	 * queues virtchnl message, as the interrupts will be disabled after
 	 * that
 	 */
-	if (unlikely(q_vector->num_txq && test_bit(__IDPF_Q_POLL_MODE,
-						   q_vector->tx[0]->flags)))
+	if (unlikely(q_vector->num_txq && idpf_queue_has(POLL_MODE,
+							 q_vector->tx[0])))
 		return budget;
 
 	work_done = min_t(int, work_done, budget - 1);
@@ -6180,10 +5633,14 @@ int idpf_vport_intr_alloc(struct idpf_vport *vport, struct idpf_vgrp *vgrp)
 {
 	u16 txqs_per_vector, rxqs_per_vector, bufq_per_vector, num_txq_vec_need;
 	struct idpf_intr_grp *intr_grp = &vgrp->intr_grp;
+	struct idpf_vport_user_config_data *user_config;
 	struct idpf_q_grp *q_grp = &vgrp->q_grp;
 	struct idpf_q_vector *q_vector;
-	int i, err;
+	struct idpf_q_coalesce *q_coal;
+	u16 idx = vport->idx;
+	u32 v_idx;
 
+	user_config = &vport->adapter->vport_config[idx]->user_config;
 	intr_grp->q_vectors = kcalloc(intr_grp->num_q_vectors,
 				      sizeof(struct idpf_q_vector),
 				      GFP_KERNEL);
@@ -6208,33 +5665,30 @@ int idpf_vport_intr_alloc(struct idpf_vport *vport, struct idpf_vgrp *vgrp)
 		txqs_per_vector *= 2;
 
 #endif /* HAVE_XDP_SUPPORT */
-	for (i = 0; i < intr_grp->num_q_vectors; i++) {
-		q_vector = &intr_grp->q_vectors[i];
+	for (v_idx = 0; v_idx < intr_grp->num_q_vectors; v_idx++) {
+		q_vector = &intr_grp->q_vectors[v_idx];
+		q_coal = &user_config->q_coalesce[v_idx];
 		q_vector->vport = vport;
 
-		q_vector->tx_itr_value = IDPF_ITR_TX_DEF;
-		q_vector->tx_intr_mode = IDPF_ITR_DYNAMIC;
+		q_vector->tx_itr_value = q_coal->tx_coalesce_usecs;
+		q_vector->tx_intr_mode = q_coal->tx_intr_mode;
 		q_vector->tx_itr_idx = VIRTCHNL2_ITR_IDX_1;
 
-		q_vector->rx_itr_value = IDPF_ITR_RX_DEF;
-		q_vector->rx_intr_mode = IDPF_ITR_DYNAMIC;
+		q_vector->rx_itr_value = q_coal->rx_coalesce_usecs;
+		q_vector->rx_intr_mode = q_coal->rx_intr_mode;
 		q_vector->rx_itr_idx = VIRTCHNL2_ITR_IDX_0;
 
 		q_vector->tx = kcalloc(txqs_per_vector,
 				       sizeof(struct idpf_queue *),
 				       GFP_KERNEL);
-		if (!q_vector->tx) {
-			err = -ENOMEM;
+		if (!q_vector->tx)
 			goto error;
-		}
 
 		q_vector->rx = kcalloc(rxqs_per_vector,
 				       sizeof(struct idpf_queue *),
 				       GFP_KERNEL);
-		if (!q_vector->rx) {
-			err = -ENOMEM;
+		if (!q_vector->rx)
 			goto error;
-		}
 
 		if (!idpf_is_queue_model_split(q_grp->rxq_model))
 			continue;
@@ -6242,17 +5696,16 @@ int idpf_vport_intr_alloc(struct idpf_vport *vport, struct idpf_vgrp *vgrp)
 		q_vector->bufq = kcalloc(bufq_per_vector,
 					 sizeof(struct idpf_queue *),
 					 GFP_KERNEL);
-		if (!q_vector->bufq) {
-			err = -ENOMEM;
+		if (!q_vector->bufq)
 			goto error;
-		}
 	}
 
 	return 0;
 
 error:
 	idpf_vport_intr_rel(vgrp);
-	return err;
+
+	return -ENOMEM;
 }
 
 /**

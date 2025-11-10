@@ -86,14 +86,29 @@ void irdma_process_ceq(struct irdma_pci_f *rf, struct irdma_ceq *ceq)
 	struct irdma_sc_ceq *sc_ceq;
 	struct irdma_sc_cq *cq;
 	unsigned long flags;
+	void *temp_cq;
 
 	sc_ceq = &ceq->sc_ceq;
 	do {
 		spin_lock_irqsave(&ceq->ce_lock, flags);
-		cq = irdma_sc_process_ceq(dev, sc_ceq);
-		if (!cq) {
+
+		temp_cq = irdma_sc_process_ceq(dev, sc_ceq);
+		if (!temp_cq || rf->reset) {
 			spin_unlock_irqrestore(&ceq->ce_lock, flags);
 			break;
+		}
+
+		if (dev->hw_wa & DEFUNCT_CQ_WA) {
+			if (temp_cq == &rf->ccq.sc_cq) {
+				cq = &rf->ccq.sc_cq;
+			} else {
+				struct irdma_cq *icq = temp_cq;
+
+				cq = &icq->sc_cq;
+			}
+			irdma_sc_cq_ack(cq);
+		} else {
+			cq = temp_cq;
 		}
 
 		if (cq->cq_type == IRDMA_CQ_TYPE_IWARP)
@@ -179,8 +194,10 @@ static void irdma_process_ae_def_cmpl(struct irdma_pci_f *rf,
 /**
  * irdma_process_aeq - handle aeq events
  * @rf: RDMA PCI function
+ *
+ * Return: True if an AE was processed.
  */
-void irdma_process_aeq(struct irdma_pci_f *rf)
+bool irdma_process_aeq(struct irdma_pci_f *rf)
 {
 	struct irdma_sc_dev *dev = &rf->sc_dev;
 	struct irdma_aeq *aeq = &rf->aeq;
@@ -196,11 +213,10 @@ void irdma_process_aeq(struct irdma_pci_f *rf)
 	struct irdma_srq *iwsrq;
 	u64 srq_id;
 	unsigned long flags;
-
 	u32 aeqcnt = 0;
 
 	if (!sc_aeq->size)
-		return;
+		return false;
 
 	do {
 		memset(info, 0, sizeof(*info));
@@ -212,7 +228,7 @@ void irdma_process_aeq(struct irdma_pci_f *rf)
 			ibdev_err(&iwdev->ibdev, "AEQ has overflowed\n");
 			rf->reset = true;
 			rf->gen_ops.request_reset(rf);
-			return;
+			return (aeqcnt > 0);
 		}
 
 		aeqcnt++;
@@ -452,6 +468,8 @@ void irdma_process_aeq(struct irdma_pci_f *rf)
 
 	if (aeqcnt)
 		irdma_sc_repost_aeq_entries(dev, aeqcnt);
+
+	return (aeqcnt > 0);
 }
 
 /**
@@ -475,11 +493,15 @@ static irqreturn_t irdma_aeq_ceq0_irq_thread(int irq, void *private)
 
 	if (rf->msix_shared)
 		irdma_process_ceq(rf, rf->ceqlist);
+
 	if (rf->sc_dev.hw_wa & AEQ_POLL) {
 		irdma_ena_intr(&rf->sc_dev, rf->iw_msixtbl[0].idx);
 		return IRQ_HANDLED;
 	}
-	irdma_process_aeq(rf);
+
+	if (!irdma_process_aeq(rf))
+		atomic_set(&rf->ceq0_int_good, 1);
+
 	irdma_ena_intr(&rf->sc_dev, rf->iw_msixtbl[0].idx);
 
 	return IRQ_HANDLED;
@@ -714,7 +736,8 @@ static void irdma_destroy_ceq(struct irdma_pci_f *rf, struct irdma_ceq *iwceq)
 		ibdev_dbg(to_ibdev(dev), "ERR: CEQ destroy completion failed %d\n",
 			  status);
 exit:
-	kfree(iwceq->sc_ceq.reg_cq);
+	if (dev->hw_wa & CEQ_POLL)
+		kfree(iwceq->sc_ceq.reg_cq);
 	dma_free_coherent(dev->hw->device, iwceq->mem.size, iwceq->mem.va,
 			  iwceq->mem.pa);
 	iwceq->mem.va = NULL;
@@ -781,6 +804,8 @@ static void irdma_del_ceqs(struct irdma_pci_f *rf)
 		irdma_destroy_irq(rf, msix_vec, iwceq);
 		irdma_cqp_ceq_cmd(&rf->sc_dev, &iwceq->sc_ceq,
 				  IRDMA_OP_CEQ_DESTROY);
+		if (rf->sc_dev.hw_wa & CEQ_POLL)
+			kfree(iwceq->sc_ceq.reg_cq);
 		dma_free_coherent(rf->sc_dev.hw->device, iwceq->mem.size,
 				  iwceq->mem.va, iwceq->mem.pa);
 		iwceq->mem.va = NULL;
@@ -1365,7 +1390,8 @@ static int irdma_create_ceq(struct irdma_pci_f *rf, struct irdma_ceq *iwceq,
 	info.ceqe_base = iwceq->mem.va;
 	info.ceqe_pa = iwceq->mem.pa;
 	info.elem_cnt = ceq_size;
-	info.reg_cq = kzalloc(sizeof(struct irdma_sc_cq *) * info.elem_cnt, GFP_KERNEL);
+	if (dev->hw_wa & CEQ_POLL)
+		info.reg_cq = kzalloc(sizeof(struct irdma_sc_cq *) * info.elem_cnt, GFP_KERNEL);
 
 	iwceq->sc_ceq.ceq_id = ceq_id;
 	info.dev = dev;
@@ -1379,7 +1405,7 @@ static int irdma_create_ceq(struct irdma_pci_f *rf, struct irdma_ceq *iwceq,
 			status = irdma_sc_cceq_create(&iwceq->sc_ceq);
 	}
 
-	if (status)
+	if (dev->hw_wa & CEQ_POLL && status)
 		kfree(info.reg_cq);
 	if (status) {
 		dma_free_coherent(dev->hw->device, iwceq->mem.size,
@@ -1584,7 +1610,8 @@ skip_virt_aeq:
 	info.aeq_elem_pa = aeq->mem.pa;
 	info.elem_cnt = aeq_size;
 	info.dev = dev;
-	info.msix_idx = rf->iw_msixtbl->idx;
+	if ((dev->hw_wa & NO_INTR) == 0)
+		info.msix_idx = rf->iw_msixtbl->idx;
 	status = irdma_sc_aeq_init(&aeq->sc_aeq, &info);
 	if (status)
 		goto err;
@@ -2076,6 +2103,11 @@ int irdma_rt_init_hw(struct irdma_device *iwdev,
 			}
 			iwdev->init_state = AEQ_CREATED;
 			rf->rsrc_created = true;
+			if (!atomic_read(&rf->ceq0_int_good)) {
+				dev_err(&rf->pcidev->dev,
+				       "irdma: No CEQ-0 interrupt detected, falling back to poll mode\n");
+				atomic_set(&rf->ceq0_wa_enable, 1);
+			}
 		}
 
 		if (iwdev->rf->sc_dev.hw_attrs.uk_attrs.hw_rev == IRDMA_GEN_1)
@@ -2190,6 +2222,10 @@ static void irdma_set_hw_rsrc(struct irdma_pci_f *rf)
 	rf->qp_table = (struct irdma_qp **)
 		(&rf->allocated_arps[BITS_TO_LONGS(rf->arp_table_size)]);
 	rf->cq_table = (struct irdma_cq **)(&rf->qp_table[rf->max_qp]);
+	if (rf->sc_dev.hw_wa & DEFUNCT_CQ_WA) {
+		rf->sc_dev.cq_table = (void **)rf->cq_table;
+		rf->sc_dev.cq_table[0] = &rf->ccq.sc_cq;
+	}
 	rf->srq_table = (struct irdma_srq **)(&rf->cq_table[rf->max_cq]);
 
 	spin_lock_init(&rf->rsrc_lock);
@@ -2830,6 +2866,9 @@ void irdma_arp_cqp_op(struct irdma_pci_f *rf, u16 arp_index,
 	struct irdma_add_arp_cache_entry_info *info;
 	struct irdma_cqp_request *cqp_request;
 	struct cqp_cmds_info *cqp_info;
+
+	if (FIELD_GET(IRDMA_SKIP_ARP_BIT, rf->sc_dev.vc_caps.feature_cap))
+		return;
 
 	cqp_request = irdma_alloc_and_get_cqp_request(&rf->cqp, false);
 	if (!cqp_request)

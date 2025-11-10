@@ -652,7 +652,7 @@ struct irdma_hmc_fpm_misc {
 	u32 max_ceqs;
 	u32 max_sds;
 	u32 loc_mem_pages;
-	u8 ird;
+	u16 ird;
 	u32 xf_block_size;
 	u32 q1_block_size;
 	u32 ht_multiplier;
@@ -804,6 +804,7 @@ struct irdma_sc_dev {
 	bool double_vlan_en:1;
 	bool multi_qs_enabled:1;
 	u8 protocol_used;
+	void **cq_table;
 	u64 hw_wa;	// Will have bit values for hw work arounds
 	u32 wa_mem_pages;
 	u8 rrf_multiplier;
@@ -1328,6 +1329,7 @@ struct irdma_dealloc_stag_info {
 	u32 pd_id;
 	bool mr:1;
 	bool dealloc_pbl:1;
+	bool skip_flush_markers:1;
 };
 
 struct irdma_register_shared_stag {
@@ -1547,6 +1549,7 @@ void irdma_sc_qp_setctx_roce(struct irdma_sc_qp *qp, __le64 *qp_ctx,
 int irdma_sc_cq_destroy(struct irdma_sc_cq *cq, u64 scratch, bool post_sq);
 int irdma_sc_cq_init(struct irdma_sc_cq *cq, struct irdma_cq_init_info *info);
 void irdma_sc_cq_resize(struct irdma_sc_cq *cq, struct irdma_modify_cq_info *info);
+void irdma_sc_cq_ack(struct irdma_sc_cq *cq);
 int irdma_sc_aeq_destroy(struct irdma_sc_aeq *aeq, u64 scratch, bool post_sq);
 int irdma_sc_static_hmc_pages_allocated(struct irdma_sc_cqp *cqp, u64 scratch,
 					u16 hmc_fn_id, bool post_sq,

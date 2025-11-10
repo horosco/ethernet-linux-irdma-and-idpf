@@ -720,6 +720,7 @@ enum ib_port_phys_state {
 #define DESTROY_AH_VER_1
 #define CREATE_QP_VER_1
 #define DESTROY_QP_VER_1
+#define ETHER_COPY_VER_2
 #define FOR_IFA
 #define GET_HW_STATS_V1
 #define GET_LINK_LAYER_V1
@@ -867,6 +868,7 @@ enum ib_port_phys_state {
 #define DEALLOC_PD_VER_1
 #define DEREG_MR_VER_1
 #define DESTROY_QP_VER_1
+#define ETHER_COPY_VER_2
 #define FOR_IFA
 #define GET_HW_STATS_V1
 #define GET_LINK_LAYER_V1
@@ -947,6 +949,7 @@ enum ib_port_phys_state {
 #define DEREG_MR_VER_1
 #define DESTROY_AH_VER_1
 #define DESTROY_QP_VER_1
+#define ETHER_COPY_VER_2
 #define FOR_IFA
 #define GET_HW_STATS_V1
 #define GET_LINK_LAYER_V1
@@ -1028,6 +1031,7 @@ enum ib_port_phys_state {
 #define DEREG_MR_VER_1
 #define DESTROY_AH_VER_1
 #define DESTROY_QP_VER_1
+#define ETHER_COPY_VER_2
 #define FOR_IFA
 #define GET_HW_STATS_V1
 #define GET_LINK_LAYER_V1
