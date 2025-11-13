@@ -109,15 +109,35 @@ static void irdma_process_ceq(struct irdma_pci_f *rf, struct irdma_ceq *ceq)
 	struct irdma_sc_ceq *sc_ceq;
 	struct irdma_sc_cq *cq;
 	unsigned long flags;
+	void *entry;
+	u32 cq_idx;
 
 	sc_ceq = &ceq->sc_ceq;
 	do {
 		spin_lock_irqsave(&ceq->ce_lock, flags);
-		cq = irdma_sc_process_ceq(dev, sc_ceq);
-		if (!cq) {
+		if (!irdma_sc_process_ceq(dev, sc_ceq, &cq_idx)) {
 			spin_unlock_irqrestore(&ceq->ce_lock, flags);
 			break;
 		}
+
+		entry = READ_ONCE(rf->cq_table[cq_idx]);
+		if (!entry) {
+			spin_unlock_irqrestore(&ceq->ce_lock, flags);
+			ibdev_dbg(to_ibdev(dev), "Stale CEQE for CQ %u\n",
+				  cq_idx);
+			continue;
+		}
+
+		if (cq_idx <= IRDMA_RSVD_CQ_ID_IEQ) {
+			cq = entry;
+		} else {
+			struct irdma_cq *icq = entry;
+
+			cq = &icq->sc_cq;
+		}
+
+		/* Ack. */
+		writel(cq->cq_uk.cq_id, cq->cq_uk.cq_ack_db);
 
 		if (cq->cq_type == IRDMA_CQ_TYPE_IWARP)
 			irdma_iwarp_ce_handler(cq);
@@ -341,6 +361,13 @@ static void irdma_process_aeq(struct irdma_pci_f *rf)
 			irdma_terminate_received(qp, info);
 			break;
 		case IRDMA_AE_CQ_OPERATION_ERROR:
+			if (info->qp_cq_id <= IRDMA_RSVD_CQ_ID_IEQ) {
+				ibdev_err(&iwdev->ibdev,
+					  "AE for reserved CQ ID %u\n",
+					  info->qp_cq_id);
+				continue;
+			}
+
 			ibdev_err(&iwdev->ibdev,
 				  "Processing an iWARP related AE for CQ misc = 0x%04X\n",
 				  info->ae_id);
@@ -1546,6 +1573,9 @@ static int irdma_initialize_ilq(struct irdma_device *iwdev)
 	status = irdma_puda_create_rsrc(&iwdev->vsi, &info);
 	if (status)
 		ibdev_dbg(&iwdev->ibdev, "ERR: ilq create fail\n");
+	else
+		WRITE_ONCE(iwdev->rf->cq_table[IRDMA_RSVD_CQ_ID_ILQ],
+			   &iwdev->vsi.ilq->cq);
 
 	return status;
 }
@@ -1574,6 +1604,9 @@ static int irdma_initialize_ieq(struct irdma_device *iwdev)
 	status = irdma_puda_create_rsrc(&iwdev->vsi, &info);
 	if (status)
 		ibdev_dbg(&iwdev->ibdev, "ERR: ieq create fail\n");
+	else
+		WRITE_ONCE(iwdev->rf->cq_table[IRDMA_RSVD_CQ_ID_IEQ],
+			   &iwdev->vsi.ieq->cq);
 
 	return status;
 }
@@ -2025,7 +2058,7 @@ static void irdma_set_hw_rsrc(struct irdma_pci_f *rf)
 	rf->allocated_arps = &rf->allocated_mcgs[BITS_TO_LONGS(rf->max_mcg)];
 	rf->qp_table = (struct irdma_qp **)
 		(&rf->allocated_arps[BITS_TO_LONGS(rf->arp_table_size)]);
-	rf->cq_table = (struct irdma_cq **)(&rf->qp_table[rf->max_qp]);
+	rf->cq_table = (void **)(&rf->qp_table[rf->max_qp]);
 
 	spin_lock_init(&rf->rsrc_lock);
 	spin_lock_init(&rf->arp_lock);
@@ -2100,7 +2133,7 @@ u32 irdma_initialize_hw_rsrc(struct irdma_pci_f *rf)
 
 	set_bit(0, rf->allocated_mrs);
 	set_bit(0, rf->allocated_qps);
-	set_bit(0, rf->allocated_cqs);
+	set_bit(IRDMA_RSVD_CQ_ID_CQP, rf->allocated_cqs);
 	set_bit(0, rf->allocated_srqs);
 	set_bit(0, rf->allocated_pds);
 	set_bit(0, rf->allocated_arps);
@@ -2108,10 +2141,12 @@ u32 irdma_initialize_hw_rsrc(struct irdma_pci_f *rf)
 	set_bit(0, rf->allocated_mcgs);
 	set_bit(2, rf->allocated_qps); /* qp 2 IEQ */
 	set_bit(1, rf->allocated_qps); /* qp 1 ILQ */
-	set_bit(1, rf->allocated_cqs);
+	set_bit(IRDMA_RSVD_CQ_ID_ILQ, rf->allocated_cqs);
 	set_bit(1, rf->allocated_pds);
-	set_bit(2, rf->allocated_cqs);
+	set_bit(IRDMA_RSVD_CQ_ID_IEQ, rf->allocated_cqs);
 	set_bit(2, rf->allocated_pds);
+
+	rf->cq_table[IRDMA_RSVD_CQ_ID_CQP] = &rf->ccq.sc_cq;
 
 	INIT_LIST_HEAD(&rf->mc_qht_list.list);
 	/* stag index mask has a minimum of 14 bits */
