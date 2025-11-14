@@ -34,6 +34,12 @@
 #define IRDMA_DEBUG_WS		"WS"
 #define IRDMA_DEBUG_STATS	"STATS"
 
+enum irdma_rsvd_cq_id {
+	IRDMA_RSVD_CQ_ID_CQP = 0,
+	IRDMA_RSVD_CQ_ID_ILQ,
+	IRDMA_RSVD_CQ_ID_IEQ,
+};
+
 enum irdma_page_size {
 	IRDMA_PAGE_SIZE_4K = 0,
 	IRDMA_PAGE_SIZE_2M,
@@ -1332,7 +1338,8 @@ int irdma_sc_ceq_destroy(struct irdma_sc_ceq *ceq, u64 scratch, bool post_sq);
 int irdma_sc_ceq_init(struct irdma_sc_ceq *ceq,
 		      struct irdma_ceq_init_info *info);
 void irdma_sc_cleanup_ceqes(struct irdma_sc_cq *cq, struct irdma_sc_ceq *ceq);
-void *irdma_sc_process_ceq(struct irdma_sc_dev *dev, struct irdma_sc_ceq *ceq);
+bool irdma_sc_process_ceq(struct irdma_sc_dev *dev, struct irdma_sc_ceq *ceq,
+			  u32 *cq_idx_out);
 
 int irdma_sc_aeq_init(struct irdma_sc_aeq *aeq,
 		      struct irdma_aeq_init_info *info);
