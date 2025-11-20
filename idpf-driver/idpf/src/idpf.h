@@ -26,6 +26,9 @@ struct idpf_rss_data;
 #include <linux/etherdevice.h>
 #include <linux/pci.h>
 #include <linux/sctp.h>
+#if IS_ENABLED(CONFIG_ETHTOOL_NETLINK)
+#include <linux/ethtool_netlink.h>
+#endif /* CONFIG_ETHTOOL_NETLINK */
 #include <linux/uio.h>
 #include <net/ip6_checksum.h>
 #ifdef HAVE_VXLAN_RX_OFFLOAD
@@ -52,7 +55,7 @@ struct idpf_rss_data;
 #endif /* CONFIG_IOMMU_BYPASS */
 
 #define IDPF_DRV_NAME "idpf"
-#define IDPF_DRV_VER "0.0.657"
+#define IDPF_DRV_VER "0.0.659"
 
 #define IDPF_M(m, s)	((m) << (s))
 
@@ -192,6 +195,16 @@ enum idpf_cap_field {
 };
 
 /**
+ * enum idpf_vport_state - Current vport state
+ * @IDPF_VPORT_UP: Vport is up
+ * @IDPF_VPORT_STATE_NBITS: Must be last, number of states
+ */
+enum idpf_vport_state {
+	IDPF_VPORT_UP,
+	IDPF_VPORT_STATE_NBITS
+ };
+
+/**
  * struct idpf_netdev_priv - Struct to store vport back pointer
  * @adapter: Adapter back pointer
  * @vport: Vport back pointer
@@ -201,7 +214,8 @@ enum idpf_cap_field {
 #ifdef HAVE_NDO_FEATURES_CHECK
  * @max_tx_hdr_size: Max header length hardware can support
 #endif
- * @active: vport is open or stopped
+ * @state: See enum idpf_vport_state
+ * @tx_max_bufs: Max buffers that can be transmitted with scatter-gather
  * @stats_lock: Lock to protect stats update
  * @netstats: Packet and byte stats
  */
@@ -214,7 +228,8 @@ struct idpf_netdev_priv {
 #ifdef HAVE_NDO_FEATURES_CHECK
 	u16 max_tx_hdr_size;
 #endif /* HAVE_NDO_FEATURES_CHECK */
-	bool active;
+	DECLARE_BITMAP(state, IDPF_VPORT_STATE_NBITS);
+	u16 tx_max_bufs;
 	spinlock_t stats_lock;
 	struct rtnl_link_stats64 netstats;
 };
@@ -527,7 +542,8 @@ struct idpf_vport {
 	bool xsk_enable_req;
 #endif
 	void (*xdp_prepare_tx_desc)(struct idpf_queue *xdpq, dma_addr_t dma,
-				    u16 idx, u32 size);
+				    u16 idx, u32 size,
+				    struct idpf_tx_splitq_params *params);
 #endif /* HAVE_XDP_SUPPORT */
 	struct idpf_rx_ptype_decoded rx_ptype_lkup[IDPF_RX_MAX_PTYPE];
 #ifdef IDPF_ADD_PROBES
@@ -558,12 +574,14 @@ struct idpf_vport {
 /**
  * enum idpf_user_flags
  * @__IDPF_PRIV_FLAGS_HDR_SPLIT: Private flag to toggle header split
+ * @__IDPF_USER_FLAG_HSPLIT: header split state
  * @__IDPF_PROMISC_UC: Unicast promiscuous mode
  * @__IDPF_PROMISC_MC: Multicast promiscuous mode
  * @__IDPF_USER_FLAGS_NBITS: Must be last
  */
 enum idpf_user_flags {
 	__IDPF_PRIV_FLAGS_HDR_SPLIT = 0,
+	__IDPF_USER_FLAG_HSPLIT = 0U,
 	__IDPF_PROMISC_UC = 32,
 	__IDPF_PROMISC_MC,
 	__IDPF_USER_FLAGS_NBITS,
@@ -588,9 +606,27 @@ struct idpf_rss_data {
 };
 
 /**
+ * struct idpf_q_coalesce - User defined coalescing configuration values for
+ *                        a single queue.
+ * @tx_intr_mode: Dynamic TX ITR or not
+ * @rx_intr_mode: Dynamic RX ITR or not
+ * @tx_coalesce_usecs: TX interrupt throttling rate
+ * @rx_coalesce_usecs: RX interrupt throttling rate
+ *
+ * Used to restore user coalescing configuration after a reset.
+ */
+struct idpf_q_coalesce {
+	u32 tx_intr_mode;
+	u32 rx_intr_mode;
+	u32 tx_coalesce_usecs;
+	u32 rx_coalesce_usecs;
+};
+
+/**
  * struct idpf_vport_user_config_data - User defined configuration values for
  *                                      each vport.
  * @rss_data: See struct idpf_rss_data
+ * @q_coalesce: Array of per queue coalescing data
  * @num_req_tx_qs: Number of user requested TX queues through ethtool
  * @num_req_rx_qs: Number of user requested RX queues through ethtool
  * @num_req_txq_desc: Number of user requested TX queue descriptors through
@@ -604,6 +640,7 @@ struct idpf_rss_data {
  */
 struct idpf_vport_user_config_data {
 	struct idpf_rss_data rss_data;
+	struct idpf_q_coalesce *q_coalesce;
 	u16 num_req_tx_qs;
 	u16 num_req_rx_qs;
 	u32 num_req_txq_desc;
@@ -972,16 +1009,16 @@ static inline u16 idpf_get_reserved_rdma_vecs(struct idpf_adapter *adapter)
 }
 
 #define IDPF_CAP_RSS (\
-	VIRTCHNL2_CAP_RSS_IPV4_TCP	|\
-	VIRTCHNL2_CAP_RSS_IPV4_TCP	|\
-	VIRTCHNL2_CAP_RSS_IPV4_UDP	|\
-	VIRTCHNL2_CAP_RSS_IPV4_SCTP	|\
-	VIRTCHNL2_CAP_RSS_IPV4_OTHER	|\
-	VIRTCHNL2_CAP_RSS_IPV6_TCP	|\
-	VIRTCHNL2_CAP_RSS_IPV6_TCP	|\
-	VIRTCHNL2_CAP_RSS_IPV6_UDP	|\
-	VIRTCHNL2_CAP_RSS_IPV6_SCTP	|\
-	VIRTCHNL2_CAP_RSS_IPV6_OTHER)
+	VIRTCHNL2_FLOW_IPV4_TCP		|\
+	VIRTCHNL2_FLOW_IPV4_TCP		|\
+	VIRTCHNL2_FLOW_IPV4_UDP		|\
+	VIRTCHNL2_FLOW_IPV4_SCTP	|\
+	VIRTCHNL2_FLOW_IPV4_OTHER	|\
+	VIRTCHNL2_FLOW_IPV6_TCP		|\
+	VIRTCHNL2_FLOW_IPV6_TCP		|\
+	VIRTCHNL2_FLOW_IPV6_UDP		|\
+	VIRTCHNL2_FLOW_IPV6_SCTP	|\
+	VIRTCHNL2_FLOW_IPV6_OTHER)
 
 #define IDPF_CAP_RSC (\
 	VIRTCHNL2_CAP_RSC_IPV4_TCP	|\
@@ -1233,7 +1270,12 @@ int idpf_vport_alloc_vec_indexes(struct idpf_vport *vport,
 void idpf_vport_dealloc_vec_indexes(struct idpf_vport *vport,
 				    struct idpf_vgrp *vgrp);
 void idpf_set_ethtool_ops(struct net_device *netdev);
+#if IS_ENABLED(CONFIG_ETHTOOL_NETLINK) && defined(HAVE_ETHTOOL_SUPPORT_TCP_DATA_SPLIT)
+u8 idpf_vport_get_hsplit(const struct idpf_vport *vport);
+bool idpf_vport_set_hsplit(const struct idpf_vport *vport, u8 val);
+#else
 void idpf_vport_set_hsplit(struct idpf_vport *vport, bool ena);
+#endif /* CONFIG_ETHTOOL_NETLINK && HAVE_ETHTOOL_SUPPORT_TCP_DATA_SPLIT */
 #ifdef DEVLINK_ENABLED
 void idpf_vport_dealloc(struct idpf_vport *vport);
 #endif /* DEVLINK_ENABLED */

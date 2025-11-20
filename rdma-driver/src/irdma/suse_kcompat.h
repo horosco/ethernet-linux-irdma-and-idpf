@@ -489,6 +489,7 @@ int irdma_del_gid(struct ib_device *device,
 #define DEREG_MR_VER_1
 #define DESTROY_AH_VER_1
 #define DESTROY_QP_VER_1
+#define ETHER_COPY_VER_2
 #define FOR_IFA
 #define GET_HW_STATS_V1
 #define GET_LINK_LAYER_V1

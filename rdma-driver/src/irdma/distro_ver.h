@@ -6,7 +6,7 @@
 #ifndef LINUX_VERSION_CODE
 #include <linux/version.h>
 #else
-#define KERNEL_VERSION(a, b, c) (((a) << 16) + ((b) << 8) + (c))
+#define KERNEL_VERSION(a, b, c) (((a) << 16) + ((b) << 8) + ((c) > 255 ? 255 : (c)))
 #endif
 
 #if defined(RHEL_RELEASE_CODE)

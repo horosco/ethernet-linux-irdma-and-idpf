@@ -19,8 +19,13 @@
 #ifdef HAVE_XDP_SUPPORT
 #include <net/xdp.h>
 #endif /* HAVE_XDP_SUPPORT */
+#include "libeth_tx.h"
 #include "idpf_lan_txrx.h"
 #include "virtchnl2_lan_desc.h"
+
+#define idpf_tx_buf_next(buf)      (*(u32 *)&(buf)->priv)
+#define idpf_tx_buf_compl_tag(buf)      (*(u32 *)&(buf)->priv)
+LIBETH_SQE_CHECK_PRIV(u32);
 
 #define IDPF_LARGE_MAX_Q			256
 #define IDPF_MAX_TXQ				IDPF_LARGE_MAX_Q
@@ -135,10 +140,9 @@
  */
 #define IDPF_TX_SPLITQ_RE_MIN_GAP	64
 
-#define IDPF_RX_BI_BUFID_S		0
-#define IDPF_RX_BI_BUFID_M		GENMASK(14, 0)
-#define IDPF_RX_BI_GEN_S		15
-#define IDPF_RX_BI_GEN_M		BIT(IDPF_RX_BI_GEN_S)
+#define IDPF_RFL_BI_GEN_M		BIT(16)
+#define IDPF_RFL_BI_BUFID_M		GENMASK(15, 0)
+
 #define IDPF_RXD_EOF_SPLITQ		VIRTCHNL2_RX_FLEX_DESC_ADV_STATUS0_EOF_M
 #define IDPF_RXD_EOF_SINGLEQ		VIRTCHNL2_RX_BASE_DESC_STATUS_EOF_M
 
@@ -165,10 +169,6 @@
 	0 : (txq)->desc_count) + \
 	(txq)->next_to_clean - (txq)->next_to_use - 1)
 
-#define IDPF_TX_BUF_RSV_UNUSED(txq)	((txq)->stash->buf_stack.top)
-#define IDPF_TX_BUF_RSV_LOW(txq)	(IDPF_TX_BUF_RSV_UNUSED(txq) < \
-					 (txq)->desc_count >> 2)
-
 #define IDPF_TX_COMPLQ_OVERFLOW_THRESH(txcq)	((txcq)->desc_count >> 1)
 /* Determine the absolute number of completions pending, i.e. the number of
  * completions that are expected to arrive on the TX completion queue.  This
@@ -181,12 +181,9 @@
 #define IDPF_TX_COMPLQ_PENDING(txq)	\
 	((txq)->num_completions_pending - (txq)->complq->tx.num_completions)
 
-#define IDPF_TX_SPLITQ_COMPL_TAG_WIDTH	16
-#define IDPF_TX_SPLITQ_MISS_COMPL_TAG	BIT(15)
-/* Adjust the generation for the completion tag and wrap if necessary */
-#define IDPF_TX_ADJ_COMPL_TAG_GEN(txq) \
-	((++(txq)->compl_tag_cur_gen) >= (txq)->compl_tag_gen_max ? \
-	0 : (txq)->compl_tag_cur_gen)
+#define IDPF_TX_SPLITQ_MISS_COMPL_TAG  BIT(15)
+
+#define IDPF_TXBUF_NULL			U32_MAX
 
 #define IDPF_TXD_LAST_DESC_CMD (IDPF_TX_DESC_CMD_EOP | IDPF_TX_DESC_CMD_RS)
 
@@ -214,100 +211,21 @@ union idpf_tx_flex_desc {
 	struct idpf_flex_tx_sched_desc flow;
 };
 
-/**
- * enum idpf_tx_buf_type - Type of &idpf_tx_buf to act on Tx completion
- * @IDPF_TX_BUF_EMPTY: Unused, no action required
- * @IDPF_TX_BUF_SKB: &sk_buff, unmap and consume_skb(), update stats
- * @IDPF_TX_BUF_FRAG: Mapped skb, only unmap DMA
- * @IDPF_TX_BUF_RSVD: Indicates ring entry is reserved, i.e. buffer is empty
- *		      but should not be used, typically corresponds to context
- *		      descriptor entry, no action required during cleaning
- * @IDPF_TX_BUF_MISS: marks a buffer on the double completion exception path
- * @IDPF_TX_BUF_XDP: &xdp_buff, unmap and page_frag_free(), update stats
- * @IDPF_TX_BUF_SKB_TSTAMP: same as skb, but execute timestamp logic
- */
-enum idpf_tx_buf_type {
-	IDPF_TX_BUF_EMPTY        = 0U,
-	IDPF_TX_BUF_SKB,
-	IDPF_TX_BUF_FRAG,
-	IDPF_TX_BUF_RSVD,
-	IDPF_TX_BUF_MISS,
-	IDPF_TX_BUF_XDP,
-	IDPF_TX_BUF_SKB_TSTAMP,
-};
-
 #define IDPF_TX_TSTAMP_INVALID_IDX 0xFF
 
 /**
- * struct idpf_tx_buf
- * @skb: Pointer to the skb
-#ifdef HAVE_XDP_FRAME_STRUCT
- * @xdpf: XDP frame
-#else
- * @raw_buf: Raw buffer
-#endif
- * @bytecount: Number of bytes
- * @gso_segs: Number of GSO segments
- * @eop_idx: Index in descriptor/buffer ring of last buffer for this packet
- * @nr_frags: Total number of non empty buffers representing this packet
- * @type: Type of buffer, &idpf_tx_buf_type
- * @compl_tag: Splitq only, flow scheduling only, unique identifier for a
- *	       buffer. Used to compare with completion tag returned in buffer
- *	       completion event.  Because the completion tag is expected to be
- *	       the same in all data descriptors for a given packet, and a single
- *	       packet can span multiple buffers, we need this field to track all
- *	       buffers associated with this completion tag independently of the
- *	       buf_id. The tag consists of a N bit buf_id and M upper order
- *	       "generation bits". See compl_tag_bufid_m and compl_tag_gen_s in
- *	       struct idpf_queue. We'll use a value of -1 to indicate the tag
- *	       is not valid.
- * @len: DMA length
- * @dma: DMA address
+ * enum libeth_sqe_type_ext - extended SQE types
+ * @LIBETH_SQE_TSTAMP_SKB: SQE type for PTP SKBs
+ * @LIBETH_SQE_MISS: SQE exception path packet, only unmap DMA
+ * @LIBETH_SQE_REINJECT: exception path packet, napi_consume_skb(), update stats
  */
-struct idpf_tx_buf {
-	union {
-		struct sk_buff *skb;
-#ifdef HAVE_XDP_FRAME_STRUCT
-		struct xdp_frame *xdpf;
-#else
-		void *raw_buf;
-#endif
-	};
-	unsigned int bytecount;
-	unsigned short gso_segs;
-	u16 eop_idx;
-	u16 nr_frags:8;
-
-	u16 type:8;
-	u16 compl_tag;
-	DEFINE_DMA_UNMAP_LEN(len);
-	DEFINE_DMA_UNMAP_ADDR(dma);
+enum libeth_sqe_type_ext {
+	LIBETH_SQE_SKB_TSTAMP = 1000,
+	LIBETH_SQE_MISS,
+	LIBETH_SQE_REINJECT,
 };
 
-struct idpf_tx_stash {
-	struct hlist_node hlist;
-	struct timer_list reinject_timer;
-	struct idpf_tx_buf buf;
-	struct idpf_queue *txq;
-	/* Keep track of whether this packet was sent on the exception path
-	 * either because the driver received a miss completion and is waiting
-	 * on a reinject completion or because the driver received a reinject
-	 * completion and is waiting on a follow up completion.
-	 */
-	bool miss_pkt;
-};
-
-/**
- * struct idpf_buf_lifo - LIFO for managing OOO completions
- * @top: Used to know how many buffers are left
- * @size: Total size of LIFO
- * @bufs: Backing array
- */
-struct idpf_buf_lifo {
-	u16 top;
-	u16 size;
-	struct idpf_tx_stash **bufs;
-};
+#define idpf_tx_buf libeth_sqe
 
 /**
  * struct idpf_tx_offload_params - Offload parameters for a given packet
@@ -341,15 +259,38 @@ struct idpf_tx_offload_params {
  * @compl_tag: Associated tag for completion
  * @td_tag: Descriptor tunneling tag
  * @offload: Offload parameters
+ * @prev_ntu: stored TxQ next_to_use in case of rollback
+ * @prev_refill_ntc: stored refillq next_to_clean in case of packet rollback
+ * @prev_refill_gen: stored refillq generation bit in case of packet rollback
  */
 struct idpf_tx_splitq_params {
 	enum idpf_tx_desc_dtype_value dtype;
 	u16 eop_cmd;
 	union {
-		u16 compl_tag;
+		u32 compl_tag;
 		u16 td_tag;
 	};
 	struct idpf_tx_offload_params offload;
+
+	u16 prev_ntu;
+	u16 prev_refill_ntc;
+	bool prev_refill_gen;
+};
+
+/**
+ * struct idpf_reinject_timer
+ * @timer: Timer to bound how long a pkt can be on the exception path
+ * @txq: Pointer to the TX queue that this packet belongs to
+ * @skb: Pointer to the skb that is being reinjected
+ * @bytes: Number of bytes in the skb
+ * @gso_segs: Number of segments in the skb
+ */
+struct idpf_reinject_timer {
+	struct timer_list timer;
+	struct idpf_queue *txq;
+	struct sk_buff *skb;
+	u32 bytes;
+	u16 gso_segs;
 };
 
 enum idpf_tx_ctx_desc_eipt_offload {
@@ -554,7 +495,7 @@ struct idpf_rx_ptype_decoded {
  *		      to 1 and knows that reading a gen bit of 1 in any
  *		      descriptor on the initial pass of the ring indicates a
  *		      writeback. It also flips on every ring wrap.
- * @__IDPF_RFLQ_GEN_CHK: Refill queues are SW only, so Q_GEN acts as the HW bit
+ * @__IDPF_Q_RFL_GEN_CHK: Refill queues are SW only, so Q_GEN acts as the HW bit
  *			 and RFLGQ_GEN is the SW bit.
  * @__IDPF_Q_FLOW_SCH_EN: Enable flow scheduling
  * @__IDPF_Q_ETF_EN: Enable ETF
@@ -568,7 +509,7 @@ struct idpf_rx_ptype_decoded {
  */
 enum idpf_queue_flags_t {
 	__IDPF_Q_GEN_CHK,
-	__IDPF_RFLQ_GEN_CHK,
+	__IDPF_Q_RFL_GEN_CHK,
 	__IDPF_Q_FLOW_SCH_EN,
 	__IDPF_Q_ETF_EN,
 	__IDPF_Q_SW_MARKER,
@@ -579,6 +520,16 @@ enum idpf_queue_flags_t {
 	__IDPF_Q_MISS_TAG_EN,
 	__IDPF_Q_FLAGS_NBITS,
 };
+
+#define idpf_queue_set(f, q)            __set_bit(__IDPF_Q_##f, (q)->flags)
+#define idpf_queue_clear(f, q)          __clear_bit(__IDPF_Q_##f, (q)->flags)
+#define idpf_queue_change(f, q)         __change_bit(__IDPF_Q_##f, (q)->flags)
+#define idpf_queue_has(f, q)            test_bit(__IDPF_Q_##f, (q)->flags)
+
+#define idpf_queue_has_clear(f, q)                      \
+	test_and_clear_bit(__IDPF_Q_##f, (q)->flags)
+#define idpf_queue_assign(f, q, v)                      \
+	__assign_bit(__IDPF_Q_##f, (q)->flags, v)
 
 /**
  * struct idpf_vec_regs
@@ -705,37 +656,13 @@ struct idpf_tx_queue_stats {
 #ifdef CONFIG_TX_TIMEOUT_VERBOSE
 	u64_stats_t busy_q_restarts;
 	u64_stats_t busy_low_txq_descs;
-	u64_stats_t busy_low_rsv_bufs;
 	u64_stats_t busy_too_many_pend_compl;
-	u64_stats_t hash_tbl_pkt_cleans;
-	u64_stats_t ring_pkt_cleans;
-	u64_stats_t rs_invalid_first_buf;
-	u64_stats_t re_invalid_first_buf;
-	u64_stats_t re_pkt_stash;
-	u64_stats_t re_pkt_stash_fail;
-	u64_stats_t ooo_compl_stash;
-	u64_stats_t ooo_compl_stash_fail;
 	u64_stats_t complq_clean_incomplete;
 	u64_stats_t sharedrxq_clean_incomplete;
 #endif /* CONFIG_TX_TIMEOUT_VERBOSE */
 	u64_stats_t lso_bytes;
 	u64_stats_t lso_segs_tot;
 	u64_stats_t segs[IDPF_MAX_SEGS];
-};
-
-struct idpf_cleaned_stats {
-	u32 packets;
-	u32 bytes;
-#ifdef CONFIG_TX_TIMEOUT_VERBOSE
-	u16 hash_tbl_pkt_cleans;
-	u16 ring_pkt_cleans;
-	u16 rs_invalid_first_buf;
-	u16 re_invalid_first_buf;
-	u16 re_pkt_stash;
-	u16 re_pkt_stash_fail;
-	u16 ooo_compl_stash;
-	u16 ooo_compl_stash_fail;
-#endif /* CONFIG_TX_TIMEOUT_VERBOSE */
 };
 
 union idpf_queue_stats {
@@ -760,36 +687,25 @@ union idpf_queue_stats {
 
 /**
  * struct idpf_sw_queue
- * @next_to_clean: Next descriptor to clean
- * @next_to_alloc: Buffer to allocate at
- * @flags: See enum idpf_queue_flags_t
  * @ring: Pointer to the ring
+ * @flags: See enum idpf_queue_flags_t
  * @desc_count: Descriptor count
- * @dev: Device back pointer for DMA mapping
+ * @next_to_use: Buffer to allocate at
+ * @next_to_clean: Next descriptor to clean
  *
  * Software queues are used in splitq mode to manage buffers between rxq
  * producer and the bufq consumer. These are required in order to maintain a
  * lockless buffer management system and are strictly software only constructs.
  */
 struct idpf_sw_queue {
-	u16 next_to_clean;
-	u16 next_to_alloc;
-	DECLARE_BITMAP(flags, __IDPF_Q_FLAGS_NBITS);
-	u16 *ring;
-	u16 desc_count;
-	struct device *dev;
-} ____cacheline_internodealigned_in_smp;
+	u32 *ring;
 
-/**
- * struct idpf_txq_stash
- * @buf_stack: Stack of empty buffers to store buffer info for out of order
- *	       buffer completions. See struct idpf_buf_lifo.
- * @sched_buf_hash: Hash table to stores buffers
- */
-struct idpf_txq_stash {
-	struct idpf_buf_lifo buf_stack;
-	DECLARE_HASHTABLE(sched_buf_hash, 12);
-};
+	DECLARE_BITMAP(flags, __IDPF_Q_FLAGS_NBITS);
+	u32 desc_count;
+
+	u32 next_to_use;
+	u32 next_to_clean;
+} ____cacheline_internodealigned_in_smp;
 
 /**
  * struct idpf_queue
@@ -797,11 +713,12 @@ struct idpf_txq_stash {
  * @vport: Back pointer to associated vport
  * @netdev: &net_device corresponding to this queue
  * @tx: Structure with TX descriptor and TX completion queue related members
+ * @tx.refillq: Pointer to refill queue
+ * @tx.bufs: See struct idpf_tx_buf
  * @tx.num_completions: Only relevant for TX completion queue. It tracks the
  *			number of completions received to compare against the
  *			number of completions pending, as accumulated by the
  *			TX queues.
- * @tx.bufs: See struct idpf_tx_buf
  * @tx.rel_qid: Relative completion queue id
  * @tx.num_txq: Number of TX queues mapped to the completion queue
  * @rx: Structure with RX completion and RX buffer queue related members
@@ -865,6 +782,7 @@ struct idpf_txq_stash {
  * @size: Length of descriptor ring in bytes
  * @dma: Physical address of ring
  * @desc_ring: Descriptor ring memory
+ * @buf_pool_size: Total number of idpf_tx_buf
  * @xdp_prog: BPF program. Used only for RX completion queue
 #ifdef HAVE_XDP_BUFF_RXQ
  * @xdp_rxq: XDP RX queue. Used for XDP memory model setting
@@ -880,30 +798,6 @@ struct idpf_txq_stash {
  * @tx_max_bufs: Max buffers that can be transmitted with scatter-gather
  * @crc_enable: Enable CRC insertion offload
  * @tx_min_pkt_len: Min supported packet length
- * @compl_tag_bufid_m: Completion tag buffer id mask
- * @compl_tag_gen_s: Completion tag generation bit
- *	The format of the completion tag will change based on the TXQ
- *	descriptor ring size so that we can maintain roughly the same level
- *	of "uniqueness" across all descriptor sizes. For example, if the
- *	TXQ descriptor ring size is 64 (the minimum size supported), the
- *	completion tag will be formatted as below:
- *	15                 6 5         0
- *	--------------------------------
- *	|    GEN=0-1023     |IDX = 0-63|
- *	--------------------------------
- *
- *	This gives us 64*1024 = 65536 possible unique values. Similarly, if
- *	the TXQ descriptor ring size is 8160 (the maximum size supported),
- *	the completion tag will be formatted as below:
- *	15 13 12                       0
- *	--------------------------------
- *	|GEN |       IDX = 0-8159      |
- *	--------------------------------
- *
- *	This gives us 8*8160 = 65280 possible unique values.
- * @compl_tag_cur_gen: Used to keep track of current completion tag generation
- * @compl_tag_gen_max: To determine when compl_tag_cur_gen should be reset
- * @stash: pointer to stashing structures
  */
 struct idpf_queue {
 	struct device *dev;
@@ -912,8 +806,9 @@ struct idpf_queue {
 	struct idpf_txq_group *txq_grp;
 	union {
 		struct {
-			u32 num_completions;
 			struct idpf_tx_buf *bufs;
+			struct idpf_sw_queue *refillq;
+			u32 num_completions;
 			u32 rel_qid;
 			u16 num_txq;
 			u16 last_re;
@@ -970,6 +865,7 @@ struct idpf_queue {
 	unsigned int size;
 	dma_addr_t dma;
 	void *desc_ring;
+	u32 buf_pool_size;
 
 	struct bpf_prog *xdp_prog;
 #ifdef HAVE_XDP_BUFF_RXQ
@@ -984,13 +880,7 @@ struct idpf_queue {
 	bool crc_enable;
 	u8 tx_min_pkt_len;
 
-	u16 compl_tag_bufid_m;
-	u16 compl_tag_gen_s;
-
-	u16 compl_tag_cur_gen;
-	u16 compl_tag_gen_max;
-
-	struct idpf_txq_stash *stash;
+	struct xarray reinject_timers;
 } ____cacheline_internodealigned_in_smp;
 
 /**
@@ -1100,6 +990,37 @@ static inline __le64 idpf_tx_singleq_build_ctob(u64 td_cmd, u64 td_offset,
 			   (td_tag << IDPF_TXD_QW1_L2TAG1_S));
 }
 
+/**
+ * idpf_tx_get_free_buf_id - get a free buffer ID from the refill queue
+ * @refillq: refill queue to get buffer ID from
+ * @buf_id: return buffer ID
+ *
+ * Return: true if a buffer ID was found, false if not
+ */
+static inline bool idpf_tx_get_free_buf_id(struct idpf_sw_queue *refillq,
+					   u32 *buf_id)
+{
+	u32 ntc = refillq->next_to_clean;
+	u32 refill_desc;
+
+	refill_desc = refillq->ring[ntc];
+
+	if (unlikely(idpf_queue_has(RFL_GEN_CHK, refillq) !=
+		     !!(refill_desc & IDPF_RFL_BI_GEN_M)))
+		return false;
+
+	*buf_id = FIELD_GET(IDPF_RFL_BI_BUFID_M, refill_desc);
+
+	if (unlikely(++ntc == refillq->desc_count)) {
+		idpf_queue_change(RFL_GEN_CHK, refillq);
+		ntc = 0;
+	}
+
+	refillq->next_to_clean = ntc;
+
+	return true;
+}
+
 void idpf_tx_splitq_build_ctb(union idpf_tx_flex_desc *desc,
 			      struct idpf_tx_splitq_params *params,
 			      u16 td_cmd, u16 size);
@@ -1124,6 +1045,17 @@ idpf_tx_splitq_build_desc(union idpf_tx_flex_desc *desc,
 		idpf_tx_splitq_build_flow_desc(desc, params, td_cmd, size);
 }
 
+/**
+ * idpf_tx_splitq_get_free_bufs - get number of free buf_ids in refillq
+ * @refillq: pointer to refillq containing buf_ids
+ */
+static inline u32 idpf_tx_splitq_get_free_bufs(struct idpf_sw_queue *refillq)
+{
+	return (refillq->next_to_use > refillq->next_to_clean ?
+		0 : refillq->desc_count) +
+	       refillq->next_to_use - refillq->next_to_clean - 1;
+}
+
 int idpf_vport_singleq_napi_poll(struct napi_struct *napi, int budget);
 void idpf_vport_init_num_qs(struct idpf_vport *vport,
 			    struct virtchnl2_create_vport *vport_msg,
@@ -1138,7 +1070,7 @@ int idpf_vport_queue_alloc_all(struct idpf_vport *vport,
 			       struct idpf_q_grp *q_grp);
 void idpf_vport_queues_rel(struct idpf_vport *vport,
 			   struct idpf_q_grp *q_grp);
-void idpf_rx_post_buf_refill(struct idpf_sw_queue *refillq, u16 buf_id);
+void idpf_post_buf_refill(struct idpf_sw_queue *refillq, u16 buf_id);
 void idpf_vport_intr_rel(struct idpf_vgrp *vgrp);
 int idpf_vport_intr_alloc(struct idpf_vport *vport, struct idpf_vgrp *vgrp);
 void idpf_vport_intr_update_itr_ena_irq(struct idpf_q_vector *q_vector);
@@ -1185,12 +1117,8 @@ int idpf_xmit_xdpq(struct xdp_buff *xdp, struct idpf_queue *xdpq);
 #endif /* HAVE_XDP_FRAME_STRUCT */
 u32 idpf_size_to_txd_count(unsigned int size);
 netdev_tx_t idpf_tx_drop_skb(struct idpf_queue *tx_q, struct sk_buff *skb);
-void idpf_tx_dma_map_error(struct idpf_queue *txq, struct sk_buff *skb,
-			   struct idpf_tx_buf *first, u16 ring_idx);
-unsigned int idpf_tx_desc_count_required(struct idpf_queue *txq,
-					 struct sk_buff *skb);
-bool idpf_chk_linearize(struct sk_buff *skb, unsigned int max_bufs,
-			unsigned int count);
+unsigned int idpf_tx_res_count_required(struct idpf_queue *txq,
+					struct sk_buff *skb, u32 *buf_count);
 #ifdef HAVE_TX_TIMEOUT_TXQUEUE
 void idpf_tx_timeout(struct net_device *netdev, unsigned int txqueue);
 #else
@@ -1214,15 +1142,19 @@ int idpf_rx_xdp(struct idpf_queue *rxq, struct idpf_queue *xdpq,
 		struct idpf_rx_buf *rx_buf, unsigned int size);
 INDIRECT_CALLABLE_DECLARE(void idpf_prepare_xdp_tx_splitq_desc(struct idpf_queue *xdpq,
 							       dma_addr_t dma, u16 idx,
-							       u32 size));
+							       u32 size,
+							       struct idpf_tx_splitq_params *params));
 void idpf_prepare_xdp_tx_splitq_desc(struct idpf_queue *xdpq, dma_addr_t dma,
-				     u16 idx, u32 size);
+				     u16 idx, u32 size,
+				     struct idpf_tx_splitq_params *params);
 
 INDIRECT_CALLABLE_DECLARE(void idpf_prepare_xdp_tx_singleq_desc(struct idpf_queue *xdpq,
 								dma_addr_t dma, u16 idx,
-								u32 size));
+								u32 size,
+								struct idpf_tx_splitq_params *params));
 void idpf_prepare_xdp_tx_singleq_desc(struct idpf_queue *xdpq, dma_addr_t dma,
-				      u16 idx, u32 size);
+				      u16 idx, u32 size,
+				      struct idpf_tx_splitq_params *params);
 int idpf_xdp_rxq_init(struct idpf_queue *q);
 #endif /* HAVE_XDP_SUPPORT */
 int idpf_tso(struct sk_buff *skb, struct idpf_tx_offload_params *off);

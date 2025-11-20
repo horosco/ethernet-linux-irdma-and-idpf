@@ -536,7 +536,7 @@ static int idpf_del_mac_filter(struct idpf_vport *vport,
 	}
 	spin_unlock_bh(&vport_config->mac_filter_list_lock);
 
-	if (np->active) {
+	if (test_bit(IDPF_VPORT_UP, np->state)) {
 		int err;
 
 		err = idpf_add_del_mac_filters(vport, np, false, async);
@@ -607,7 +607,7 @@ static int idpf_add_mac_filter(struct idpf_vport *vport,
 	if (err)
 		return err;
 
-	if (np->active)
+	if (test_bit(IDPF_VPORT_UP, np->state))
 		err = idpf_add_del_mac_filters(vport, np, true, async);
 
 	return err;
@@ -822,6 +822,7 @@ static int idpf_cfg_netdev(struct idpf_vport *vport)
 #ifdef HAVE_NDO_FEATURES_CHECK
 		np->max_tx_hdr_size = idpf_get_max_tx_hdr_size(adapter);
 #endif /* HAVE_NDO_FEATURES_CHECK */
+		np->tx_max_bufs = idpf_get_max_tx_bufs(adapter);
 		vport->netdev = netdev;
 
 		return idpf_init_mac_addr(vport, netdev);
@@ -842,6 +843,7 @@ static int idpf_cfg_netdev(struct idpf_vport *vport)
 #ifdef HAVE_NDO_FEATURES_CHECK
 	np->max_tx_hdr_size = idpf_get_max_tx_hdr_size(adapter);
 #endif /* HAVE_NDO_FEATURES_CHECK */
+	np->tx_max_bufs = idpf_get_max_tx_bufs(adapter);
 
 	spin_lock_init(&np->stats_lock);
 
@@ -1012,7 +1014,7 @@ static void idpf_vport_stop(struct idpf_vport *vport)
 	struct idpf_netdev_priv *np = netdev_priv(vport->netdev);
 	struct idpf_vgrp *vgrp = &vport->dflt_grp;
 
-	if (!np->active)
+	if (!test_and_clear_bit(IDPF_VPORT_UP, np->state))
 		return;
 
 	/* Make sure soft reset has finished */
@@ -1038,7 +1040,6 @@ static void idpf_vport_stop(struct idpf_vport *vport)
 	idpf_vport_intr_deinit(vport, &vgrp->intr_grp);
 	idpf_vport_queues_rel(vport, &vgrp->q_grp);
 	idpf_vport_intr_rel(vgrp);
-	np->active = false;
 }
 
 /**
@@ -1199,6 +1200,72 @@ static void idpf_vport_dealloc(struct idpf_vport *vport)
 	adapter->next_vport = idpf_get_free_slot(adapter);
 }
 
+#if IS_ENABLED(CONFIG_ETHTOOL_NETLINK) && defined(HAVE_ETHTOOL_SUPPORT_TCP_DATA_SPLIT)
+/**
+ * idpf_is_hsplit_supported - check whether the header split is supported
+ * @vport: virtual port to check the capability for
+ *
+ * Return: true if it's supported by the HW/FW, false if not.
+ */
+static bool idpf_is_hsplit_supported(const struct idpf_vport *vport)
+{
+	return idpf_is_queue_model_split(vport->dflt_grp.q_grp.rxq_model) &&
+	       idpf_is_cap_ena_all(vport->adapter, IDPF_HSPLIT_CAPS,
+				   IDPF_CAP_HSPLIT);
+}
+
+/**
+ * idpf_vport_get_hsplit - get the current header split feature state
+ * @vport: virtual port to query the state for
+ *
+ * Return: ``ETHTOOL_TCP_DATA_SPLIT_UNKNOWN`` if not supported,
+ *         ``ETHTOOL_TCP_DATA_SPLIT_DISABLED`` if disabled,
+ *         ``ETHTOOL_TCP_DATA_SPLIT_ENABLED`` if active.
+ */
+u8 idpf_vport_get_hsplit(const struct idpf_vport *vport)
+{
+	const struct idpf_vport_user_config_data *config;
+
+	if (!idpf_is_hsplit_supported(vport))
+		return ETHTOOL_TCP_DATA_SPLIT_UNKNOWN;
+
+	config = &vport->adapter->vport_config[vport->idx]->user_config;
+
+	return test_bit(__IDPF_USER_FLAG_HSPLIT, config->user_flags) ?
+	       ETHTOOL_TCP_DATA_SPLIT_ENABLED :
+	       ETHTOOL_TCP_DATA_SPLIT_DISABLED;
+}
+
+/**
+ * idpf_vport_set_hsplit - enable or disable header split on a given vport
+ * @vport: virtual port to configure
+ * @val: Ethtool flag controlling the header split state
+ *
+ * Return: true on success, false if not supported by the HW.
+ */
+bool idpf_vport_set_hsplit(const struct idpf_vport *vport, u8 val)
+{
+	struct idpf_vport_user_config_data *config;
+
+	if (!idpf_is_hsplit_supported(vport))
+		return val == ETHTOOL_TCP_DATA_SPLIT_UNKNOWN;
+
+	config = &vport->adapter->vport_config[vport->idx]->user_config;
+
+	switch (val) {
+	case ETHTOOL_TCP_DATA_SPLIT_UNKNOWN:
+		/* Default is to enable */
+	case ETHTOOL_TCP_DATA_SPLIT_ENABLED:
+		__set_bit(__IDPF_USER_FLAG_HSPLIT, config->user_flags);
+		return true;
+	case ETHTOOL_TCP_DATA_SPLIT_DISABLED:
+		__clear_bit(__IDPF_USER_FLAG_HSPLIT, config->user_flags);
+		return true;
+	default:
+		return false;
+	}
+}
+#else
 /**
  * idpf_vport_set_hsplit - enable or disable header split on a given vport
  * @vport: virtual port
@@ -1209,18 +1276,18 @@ void idpf_vport_set_hsplit(struct idpf_vport *vport, bool ena)
 	struct idpf_vport_user_config_data *config_data;
 
 	config_data = &vport->adapter->vport_config[vport->idx]->user_config;
-#ifdef HAVE_XDP_SUPPORT
+
 	if (!ena) {
 		clear_bit(__IDPF_PRIV_FLAGS_HDR_SPLIT, config_data->user_flags);
 		return;
 	}
 
-#endif /* HAVE_XDP_SUPPORT */
 	if (idpf_is_cap_ena_all(vport->adapter, IDPF_HSPLIT_CAPS,
 				IDPF_CAP_HSPLIT) &&
 	    idpf_is_queue_model_split(vport->dflt_grp.q_grp.rxq_model))
 		set_bit(__IDPF_PRIV_FLAGS_HDR_SPLIT, config_data->user_flags);
 }
+#endif /* CONFIG_ETHTOOL_NETLINK && HAVE_ETHTOOL_SUPPORT_TCP_DATA_SPLIT */
 
 /**
  * idpf_vport_alloc - Allocates the next available struct vport in the adapter
@@ -1232,15 +1299,15 @@ void idpf_vport_set_hsplit(struct idpf_vport *vport, bool ena)
 static struct idpf_vport *idpf_vport_alloc(struct idpf_adapter *adapter,
 					   struct idpf_vport_max_q *max_q)
 {
-	struct idpf_vport_config *vport_config = NULL;
 	struct idpf_rss_data *rss_data;
 	struct idpf_intr_grp *intr_grp;
 	u16 idx = adapter->next_vport;
 	struct idpf_vport *vport;
 #ifndef HAVE_NETDEV_IRQ_AFFINITY_AND_ARFS
-	unsigned int i, numa;
+	unsigned int j, numa;
 #endif /* !HAVE_NETDEV_IRQ_AFFINITY_AND_ARFS */
 	u16 num_max_q;
+	int i;
 
 	if (idx == IDPF_NO_FREE_SLOT)
 		return NULL;
@@ -1249,7 +1316,10 @@ static struct idpf_vport *idpf_vport_alloc(struct idpf_adapter *adapter,
 	if (!vport)
 		return vport;
 
+	num_max_q = max(max_q->max_txq, max_q->max_rxq);
 	if (!adapter->vport_config[idx]) {
+		struct idpf_vport_config *vport_config;
+		struct idpf_q_coalesce *q_coal;
 
 		vport_config = kzalloc(sizeof(*vport_config), GFP_KERNEL);
 		if (!vport_config) {
@@ -1258,7 +1328,22 @@ static struct idpf_vport *idpf_vport_alloc(struct idpf_adapter *adapter,
 			return NULL;
 		}
 
-		adapter->vport_config[idx] = vport_config;
+	q_coal = kcalloc(num_max_q, sizeof(*q_coal), GFP_KERNEL);
+	if (!q_coal) {
+		kfree(vport_config);
+		kfree(vport);
+
+	return NULL;
+	}
+	for (i = 0; i < num_max_q; i++) {
+		q_coal[i].tx_intr_mode = IDPF_ITR_DYNAMIC;
+		q_coal[i].tx_coalesce_usecs = IDPF_ITR_TX_DEF;
+		q_coal[i].rx_intr_mode = IDPF_ITR_DYNAMIC;
+		q_coal[i].rx_coalesce_usecs = IDPF_ITR_RX_DEF;
+	}
+	vport_config->user_config.q_coalesce = q_coal;
+
+	adapter->vport_config[idx] = vport_config;
 #ifndef HAVE_NETDEV_IRQ_AFFINITY_AND_ARFS
 
 		vport_config->affinity_config = kzalloc(MAX_NUM_VEC_AFFINTY * sizeof(*vport_config->affinity_config),
@@ -1270,9 +1355,9 @@ static struct idpf_vport *idpf_vport_alloc(struct idpf_adapter *adapter,
 		}
 
 		numa = dev_to_node(&adapter->pdev->dev);
-		for (i = 0 ; i < MAX_NUM_VEC_AFFINTY ; i++)
-			cpumask_set_cpu(cpumask_local_spread(i, numa),
-					&vport_config->affinity_config[i].affinity_mask);
+		for (j = 0 ; j < MAX_NUM_VEC_AFFINTY ; j++)
+			cpumask_set_cpu(cpumask_local_spread(j, numa),
+					&vport_config->affinity_config[j].affinity_mask);
 #endif /* !HAVE_NETDEV_IRQ_AFFINITY_AND_ARFS */
 	}
 
@@ -1282,7 +1367,6 @@ static struct idpf_vport *idpf_vport_alloc(struct idpf_adapter *adapter,
 	vport->default_vport = adapter->num_alloc_vports <
 			       idpf_get_default_vports(adapter);
 
-	num_max_q = max(max_q->max_txq, max_q->max_rxq);
 	intr_grp = &vport->dflt_grp.intr_grp;
 	intr_grp->q_vector_idxs = kcalloc(num_max_q, sizeof(u16), GFP_KERNEL);
 	if (!intr_grp->q_vector_idxs)
@@ -1342,7 +1426,8 @@ static struct rtnl_link_stats64 *idpf_get_stats64(struct net_device *netdev,
 	*stats = np->netstats;
 	spin_unlock_bh(&np->stats_lock);
 
-	if (!idpf_is_resource_rel_in_prog(adapter) && np->active)
+	if (!idpf_is_resource_rel_in_prog(adapter) &&
+	    test_bit(IDPF_VPORT_UP, np->state))
 		mod_delayed_work(adapter->stats_wq, &adapter->stats_task,
 				 msecs_to_jiffies(300));
 #ifndef HAVE_VOID_NDO_GET_STATS64
@@ -1475,7 +1560,7 @@ static int idpf_up_complete(struct idpf_vport *vport)
 		netif_tx_start_all_queues(vport->netdev);
 	}
 
-	np->active = true;
+	set_bit(IDPF_VPORT_UP, np->state);
 	return 0;
 }
 
@@ -1549,7 +1634,7 @@ static int idpf_vport_open(struct idpf_vport *vport)
 	struct idpf_rss_data *rss_data;
 	int err;
 
-	if (np->active)
+	if (test_bit(IDPF_VPORT_UP, np->state))
 		return -EBUSY;
 
 	/* we do not allow interface up just yet */
@@ -1985,7 +2070,7 @@ void idpf_set_vport_state(struct idpf_adapter *adapter)
 			continue;
 
 		np = netdev_priv(adapter->netdevs[i]);
-		if (np->active)
+		if (test_bit(IDPF_VPORT_UP, np->state))
 			set_bit(IDPF_VPORT_UP_REQUESTED,
 				adapter->vport_config[i]->flags);
 	}
@@ -2097,6 +2182,7 @@ void idpf_vc_event_task(struct work_struct *work)
 
 	if (test_bit(IDPF_HR_FUNC_RESET, adapter->flags))
 		goto func_reset;
+
 	if (test_bit(IDPF_HR_DRV_LOAD, adapter->flags))
 		goto drv_load;
 
@@ -2139,16 +2225,14 @@ int idpf_initiate_soft_reset(struct idpf_vport *vport,
 			     enum idpf_vport_reset_cause reset_cause)
 {
 	struct idpf_netdev_priv *np = netdev_priv(vport->netdev);
+	bool vport_is_up = test_bit(IDPF_VPORT_UP, np->state);
 	struct idpf_adapter *adapter = vport->adapter;
 	struct idpf_vport_config *vport_config;
 	struct idpf_rss_data *rss_data;
 	struct idpf_vport *new_vport;
 	struct idpf_q_grp *new_q_grp;
 	struct idpf_q_grp *q_grp;
-	bool vport_is_up;
 	int err;
-
-	vport_is_up = np->active;
 
 	/* If the system is low on memory, we can end up in bad state if we
 	 * free all the memory for queue resources and try to allocate them
@@ -2519,11 +2603,11 @@ static int idpf_open(struct net_device *netdev)
 	idpf_vport_cfg_lock(adapter);
 	vport = idpf_netdev_to_vport(netdev);
 
-	err = idpf_vport_open(vport);
+	err = idpf_set_real_num_queues(vport);
 	if (err)
 		goto unlock;
 
-	err = idpf_set_real_num_queues(vport);
+	err = idpf_vport_open(vport);
 
 unlock:
 	idpf_vport_cfg_unlock(adapter);
@@ -2606,6 +2690,92 @@ unlock_mutex:
 	return err;
 }
 
+/**
+ * idpf_chk_tso_segment - Check skb is not using too many buffers
+ * @skb: send buffer
+ * @max_bufs: maximum number of buffers
+ *
+ * For TSO we need to count the TSO header and segment payload separately.  As
+ * such we need to check cases where we have max_bufs-1 fragments or more as we
+ * can potentially require max_bufs+1 DMA transactions, 1 for the TSO header, 1
+ * for the segment payload in the first descriptor, and another max_buf-1 for
+ * the fragments.
+ *
+ * Returns true if the packet needs to be software segmented by core stack.
+ */
+static bool idpf_chk_tso_segment(const struct sk_buff *skb,
+				 unsigned int max_bufs)
+{
+	const struct skb_shared_info *shinfo = skb_shinfo(skb);
+	const skb_frag_t *frag, *stale;
+	int nr_frags, sum;
+
+	/* no need to check if number of frags is less than max_bufs - 1 */
+	nr_frags = shinfo->nr_frags;
+	if (nr_frags < (max_bufs - 1))
+		return false;
+
+	/* We need to walk through the list and validate that each group
+	 * of max_bufs-2 fragments totals at least gso_size.
+	 */
+	nr_frags -= max_bufs - 2;
+	frag = &shinfo->frags[0];
+
+	/* Initialize size to the negative value of gso_size minus 1.  We use
+	 * this as the worst case scenario in which the frag ahead of us only
+	 * provides one byte which is why we are limited to max_bufs-2
+	 * descriptors for a single transmit as the header and previous
+	 * fragment are already consuming 2 descriptors.
+	 */
+	sum = 1 - shinfo->gso_size;
+
+	/* Add size of frags 0 through 4 to create our initial sum */
+	sum += skb_frag_size(frag++);
+	sum += skb_frag_size(frag++);
+	sum += skb_frag_size(frag++);
+	sum += skb_frag_size(frag++);
+	sum += skb_frag_size(frag++);
+
+	/* Walk through fragments adding latest fragment, testing it, and
+	 * then removing stale fragments from the sum.
+	 */
+	for (stale = &shinfo->frags[0];; stale++) {
+		int stale_size = skb_frag_size(stale);
+
+		sum += skb_frag_size(frag++);
+
+		/* The stale fragment may present us with a smaller
+		 * descriptor than the actual fragment size. To account
+		 * for that we need to remove all the data on the front and
+		 * figure out what the remainder would be in the last
+		 * descriptor associated with the fragment.
+		 */
+		if (stale_size > IDPF_TX_MAX_DESC_DATA) {
+			int align_pad = -(skb_frag_off(stale)) &
+					(IDPF_TX_MAX_READ_REQ_SIZE - 1);
+
+			sum -= align_pad;
+			stale_size -= align_pad;
+
+			do {
+				sum -= IDPF_TX_MAX_DESC_DATA_ALIGNED;
+				stale_size -= IDPF_TX_MAX_DESC_DATA_ALIGNED;
+			} while (stale_size > IDPF_TX_MAX_DESC_DATA);
+		}
+
+		/* if sum is negative we failed to make sufficient progress */
+		if (sum < 0)
+			return true;
+
+		if (!nr_frags--)
+			break;
+
+		sum -= stale_size;
+	}
+
+	return false;
+}
+
 #ifdef HAVE_NDO_FEATURES_CHECK
 /**
  * idpf_features_check - Validate packet conforms to limits
@@ -2628,12 +2798,15 @@ static netdev_features_t idpf_features_check(struct sk_buff *skb,
 	if (skb->ip_summed != CHECKSUM_PARTIAL)
 		return features;
 
-	/* We cannot support GSO if the MSS is going to be less than
-	 * 88 bytes. If it is then we need to drop support for GSO.
-	 */
-	if (skb_is_gso(skb) &&
-	    (skb_shinfo(skb)->gso_size < IDPF_TX_TSO_MIN_MSS))
-		features &= ~NETIF_F_GSO_MASK;
+	if (skb_is_gso(skb)) {
+		/* We cannot support GSO if the MSS is going to be less than
+		 * 88 bytes. If it is then we need to drop support for GSO.
+		 */
+		if (skb_shinfo(skb)->gso_size < IDPF_TX_TSO_MIN_MSS)
+			features &= ~NETIF_F_GSO_MASK;
+		else if (idpf_chk_tso_segment(skb, np->tx_max_bufs))
+			features &= ~NETIF_F_GSO_MASK;
+	}
 
 	/* Ensure MACLEN is <= 126 bytes (63 words) and not an odd size */
 	len = skb_network_offset(skb);
@@ -2825,7 +2998,7 @@ idpf_xdp_setup_prog(struct idpf_netdev_priv *np, struct bpf_prog *prog,
 	if (prog && test_bit(IDPF_HR_RESET_IN_PROG, adapter->flags))
 		return -EBUSY;
 
-	vport_is_up = np->active;
+	vport_is_up = test_bit(IDPF_VPORT_UP, np->state);
 
 	vport_config = adapter->vport_config[np->vport_idx];
 	current_prog = &vport_config->user_config.xdp_prog;
@@ -2855,10 +3028,18 @@ idpf_xdp_setup_prog(struct idpf_netdev_priv *np, struct bpf_prog *prog,
 	if (!*current_prog && prog) {
 		netdev_warn(vport->netdev,
 			    "Setting up XDP disables header split\n");
+#if IS_ENABLED(CONFIG_ETHTOOL_NETLINK) && defined(HAVE_ETHTOOL_SUPPORT_TCP_DATA_SPLIT)
+		idpf_vport_set_hsplit(vport, ETHTOOL_TCP_DATA_SPLIT_DISABLED);
+#else
 		idpf_vport_set_hsplit(vport, false);
+#endif /* CONFIG_ETHTOOL_NETLINK && HAVE_ETHTOOL_SUPPORT_TCP_DATA_SPLIT */
 		xdp_features_set_redirect_target(vport->netdev, false);
 	} else {
+#if IS_ENABLED(CONFIG_ETHTOOL_NETLINK) && defined(HAVE_ETHTOOL_SUPPORT_TCP_DATA_SPLIT)
+		idpf_vport_set_hsplit(vport, ETHTOOL_TCP_DATA_SPLIT_ENABLED);
+#else
 		idpf_vport_set_hsplit(vport, true);
+#endif /* CONFIG_ETHTOOL_NETLINK && HAVE_ETHTOOL_SUPPORT_TCP_DATA_SPLIT */
 		xdp_features_clear_redirect_target(vport->netdev);
 	}
 
@@ -2973,6 +3154,7 @@ static int idpf_set_mac(struct net_device *netdev, void *p)
 	struct sockaddr *addr = p;
 	struct idpf_adapter *adapter = np->adapter;
 	struct idpf_vport_config *vport_config;
+	u8 old_mac_addr[ETH_ALEN];
 	struct idpf_vport *vport;
 	int err = 0;
 
@@ -2996,17 +3178,19 @@ static int idpf_set_mac(struct net_device *netdev, void *p)
 	if (ether_addr_equal(netdev->dev_addr, addr->sa_data))
 		goto unlock_mutex;
 
+	ether_addr_copy(old_mac_addr, vport->default_mac_addr);
+	ether_addr_copy(vport->default_mac_addr, addr->sa_data);
 	vport_config = vport->adapter->vport_config[vport->idx];
 	err = idpf_add_mac_filter(vport, np, addr->sa_data, false);
 	if (err) {
 		__idpf_del_mac_filter(vport_config, addr->sa_data);
+		ether_addr_copy(vport->default_mac_addr, netdev->dev_addr);
 		goto unlock_mutex;
 	}
 
-	if (is_valid_ether_addr(vport->default_mac_addr))
-		idpf_del_mac_filter(vport, np, vport->default_mac_addr, false);
+	if (is_valid_ether_addr(old_mac_addr))
+		__idpf_del_mac_filter(vport_config, old_mac_addr);
 
-	ether_addr_copy(vport->default_mac_addr, addr->sa_data);
 	eth_hw_addr_set(netdev, addr->sa_data);
 
 unlock_mutex:
@@ -3032,7 +3216,8 @@ static int idpf_eth_ioctl(struct net_device *netdev, struct ifreq *ifr, int cmd)
 	vport = idpf_netdev_to_vport(netdev);
 
 	if ((!idpf_ptp_is_vport_tx_tstamp_ena(vport) &&
-	     !idpf_ptp_is_vport_rx_tstamp_ena(vport)) || !np->active) {
+	     !idpf_ptp_is_vport_rx_tstamp_ena(vport)) ||
+	     !test_bit(IDPF_VPORT_UP, np->state)) {
 		err = -EOPNOTSUPP;
 		goto free_vport;
 	}
@@ -3068,8 +3253,13 @@ void *idpf_alloc_dma_mem(struct idpf_hw *hw, struct idpf_dma_mem *mem, u64 size)
 	struct idpf_adapter *adapter = (struct idpf_adapter *)hw->back;
 	size_t sz = ALIGN(size, 4096);
 
-	mem->va = dma_alloc_coherent(idpf_adapter_to_dev(adapter), sz,
-				     &mem->pa, GFP_KERNEL);
+	/* The control queue resources are freed under a spinlock, contiguous
+	 * pages will avoid IOMMU remapping and the use vmap (and vunmap in
+	 * dma_free_*() path.
+	 */
+	mem->va = dma_alloc_attrs(&adapter->pdev->dev, sz, &mem->pa,
+				  GFP_KERNEL, DMA_ATTR_FORCE_CONTIGUOUS);
+
 	mem->size = sz;
 
 	return mem->va;
@@ -3084,8 +3274,8 @@ void idpf_free_dma_mem(struct idpf_hw *hw, struct idpf_dma_mem *mem)
 {
 	struct idpf_adapter *adapter = (struct idpf_adapter *)hw->back;
 
-	dma_free_coherent(idpf_adapter_to_dev(adapter), mem->size,
-			  mem->va, mem->pa);
+	dma_free_attrs(&adapter->pdev->dev, mem->size,
+		       mem->va, mem->pa, DMA_ATTR_FORCE_CONTIGUOUS);
 	mem->size = 0;
 	mem->va = NULL;
 	mem->pa = 0;

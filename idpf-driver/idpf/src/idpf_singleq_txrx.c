@@ -102,6 +102,58 @@ static int idpf_tx_singleq_csum(struct sk_buff *skb,
 }
 
 /**
+ * idpf_tx_singleq_dma_map_error - handle TX DMA map errors
+ * @txq: queue to send buffer on
+ * @skb: send buffer
+ * @first: original first buffer info buffer for packet
+ * @idx: starting point on ring to unwind
+ */
+static void idpf_tx_singleq_dma_map_error(struct idpf_queue *txq,
+					  struct sk_buff *skb,
+					  struct idpf_tx_buf *first, u16 idx)
+{
+	struct libeth_sq_napi_stats ss = { };
+	struct libeth_cq_pp cp = {
+		.dev	= txq->dev,
+		.ss	= &ss,
+	};
+
+	u64_stats_update_begin(&txq->stats_sync);
+	u64_stats_inc(&txq->q_stats.tx.dma_map_errs);
+	u64_stats_update_end(&txq->stats_sync);
+
+	/* clear dma mappings for failed tx_buf map */
+	for (;;) {
+		struct idpf_tx_buf *tx_buf;
+
+		tx_buf = &txq->tx.bufs[idx];
+		libeth_tx_complete(tx_buf, &cp);
+		if (tx_buf == first)
+			break;
+		if (idx == 0)
+			idx = txq->desc_count;
+		idx--;
+	}
+
+	if (skb_is_gso(skb)) {
+		union idpf_tx_flex_desc *tx_desc;
+
+		/* If we failed a DMA mapping for a TSO packet, we will have
+		 * used one additional descriptor for a context
+		 * descriptor. Reset that here.
+		 */
+		tx_desc = IDPF_FLEX_TX_DESC(txq, idx);
+		memset(tx_desc, 0, sizeof(*tx_desc));
+		if (idx == 0)
+			idx = txq->desc_count;
+		idx--;
+	}
+
+	/* Update tail in case netdev_xmit_more was previously true */
+	idpf_tx_buf_hw_update(txq, idx, false);
+}
+
+/**
  * idpf_tx_singleq_map - Build the Tx base descriptor
  * @tx_q: queue to send buffer on
  * @first: first buffer info buffer to use
@@ -140,13 +192,14 @@ static void idpf_tx_singleq_map(struct idpf_queue *tx_q,
 	for (frag = &skb_shinfo(skb)->frags[0];; frag++) {
 		unsigned int max_data = IDPF_TX_MAX_DESC_DATA_ALIGNED;
 
-		if (dma_mapping_error(tx_q->dev, dma))
-			return idpf_tx_dma_map_error(tx_q, skb, first, i);
+		if (unlikely(dma_mapping_error(tx_q->dev, dma)))
+			return idpf_tx_singleq_dma_map_error(tx_q, skb,
+							     first, i);
 
 		/* record length, and DMA address */
 		dma_unmap_len_set(tx_buf, len, size);
 		dma_unmap_addr_set(tx_buf, dma, dma);
-		tx_buf->type = IDPF_TX_BUF_FRAG;
+		tx_buf->type = LIBETH_SQE_FRAG;
 
 		/* align size to end of page */
 		max_data += -dma & (IDPF_TX_MAX_READ_REQ_SIZE - 1);
@@ -169,7 +222,7 @@ static void idpf_tx_singleq_map(struct idpf_queue *tx_q,
 				tx_desc++;
 			}
 
-			tx_buf->type = IDPF_TX_BUF_EMPTY;
+			tx_buf->type = LIBETH_SQE_EMPTY;
 
 			dma += max_data;
 			size -= max_data;
@@ -206,13 +259,13 @@ static void idpf_tx_singleq_map(struct idpf_queue *tx_q,
 	tx_desc->qw1 = idpf_tx_singleq_build_ctob(td_cmd, offsets,
 						  size, td_tag);
 
-	first->type = IDPF_TX_BUF_SKB;
-	first->eop_idx = i;
+	first->type = LIBETH_SQE_SKB;
+	first->rs_idx = i;
 
 	i = idpf_singleq_bump_desc_idx(tx_q, i);
 
 	nq = netdev_get_tx_queue(tx_q->vport->netdev, tx_q->idx);
-	netdev_tx_sent_queue(nq, first->bytecount);
+	netdev_tx_sent_queue(nq, first->bytes);
 
 	idpf_tx_buf_hw_update(tx_q, i, netdev_xmit_more());
 }
@@ -230,7 +283,7 @@ idpf_tx_singleq_get_ctx_desc(struct idpf_queue *txq)
 	struct idpf_base_tx_ctx_desc *ctx_desc;
 	int ntu = txq->next_to_use;
 
-	txq->tx.bufs[ntu].type = IDPF_TX_BUF_RSVD;
+	txq->tx.bufs[ntu].type = LIBETH_SQE_CTX;
 
 	ctx_desc = IDPF_BASE_TX_CTX_DESC(txq, ntu);
 
@@ -287,11 +340,11 @@ static netdev_tx_t idpf_tx_singleq_frame(struct sk_buff *skb,
 {
 	struct idpf_tx_offload_params offload = { };
 	struct idpf_tx_buf *first;
+	u32 count, buf_count = 1;
 	int csum, tso, needed;
-	unsigned int count;
 	__be16 protocol;
 
-	count = idpf_tx_desc_count_required(tx_q, skb);
+	count = idpf_tx_res_count_required(tx_q, skb, &buf_count);
 	if (unlikely(!count))
 		return idpf_tx_drop_skb(tx_q, skb);
 
@@ -325,11 +378,11 @@ static netdev_tx_t idpf_tx_singleq_frame(struct sk_buff *skb,
 	first->skb = skb;
 
 	if (tso) {
-		first->gso_segs = offload.tso_segs;
-		first->bytecount = skb->len + ((first->gso_segs - 1) * offload.tso_hdr_len);
+		first->packets = offload.tso_segs;
+		first->bytes = skb->len + ((first->packets - 1) * offload.tso_hdr_len);
 	} else {
-		first->bytecount = max_t(unsigned int, skb->len, ETH_ZLEN);
-		first->gso_segs = 1;
+		first->bytes = max_t(unsigned int, skb->len, ETH_ZLEN);
+		first->packets = 1;
 	}
 #ifdef IDPF_ADD_PROBES
 	idpf_tx_extra_counters(tx_q, first, &offload);
@@ -399,15 +452,15 @@ static bool idpf_tx_singleq_clean(struct idpf_queue *tx_q, int napi_budget,
 		 * such. We can skip this descriptor since there is no buffer
 		 * to clean.
 		 */
-		if (unlikely(tx_buf->type == IDPF_TX_BUF_RSVD)) {
-			tx_buf->type = IDPF_TX_BUF_EMPTY;
+		if (unlikely(tx_buf->type == LIBETH_SQE_CTX)) {
+			tx_buf->type = LIBETH_SQE_EMPTY;
 			goto fetch_next_txq_desc;
 		}
 
-		if (unlikely(tx_buf->type != IDPF_TX_BUF_SKB))
+		if (unlikely(tx_buf->type != LIBETH_SQE_SKB))
 			break;
 
-		eop_desc = IDPF_BASE_TX_DESC(tx_q, tx_buf->eop_idx);
+		eop_desc = IDPF_BASE_TX_DESC(tx_q, tx_buf->rs_idx);
 		/* prevent any other reads prior to eop_desc */
 		smp_rmb();
 
@@ -417,15 +470,15 @@ static bool idpf_tx_singleq_clean(struct idpf_queue *tx_q, int napi_budget,
 			break;
 
 		/* update the statistics for this packet */
-		total_bytes += tx_buf->bytecount;
-		total_pkts += tx_buf->gso_segs;
+		total_bytes += tx_buf->bytes;
+		total_pkts += tx_buf->packets;
 
 #ifdef HAVE_XDP_SUPPORT
 		if (test_bit(__IDPF_Q_XDP, tx_q->flags))
 #ifdef HAVE_XDP_FRAME_STRUCT
 			xdp_return_frame(tx_buf->xdpf);
 #else
-			page_frag_free(tx_buf->raw_buf);
+			page_frag_free(tx_buf->raw);
 #endif /* HAVE_XDP_FRAME_STRUCT */
 		else
 			/* free the skb */
@@ -441,7 +494,7 @@ static bool idpf_tx_singleq_clean(struct idpf_queue *tx_q, int napi_budget,
 				 DMA_TO_DEVICE);
 
 		/* clear tx_buf data */
-		tx_buf->type = IDPF_TX_BUF_EMPTY;
+		tx_buf->type = LIBETH_SQE_EMPTY;
 		tx_buf->nr_frags = 0;
 
 		/* unmap remaining buffers */
@@ -463,7 +516,7 @@ static bool idpf_tx_singleq_clean(struct idpf_queue *tx_q, int napi_budget,
 					       DMA_TO_DEVICE);
 				dma_unmap_len_set(tx_buf, len, 0);
 			}
-			tx_buf->type = IDPF_TX_BUF_EMPTY;
+			tx_buf->type = LIBETH_SQE_EMPTY;
 		}
 
 		/* update budget only if we did something */
@@ -1262,9 +1315,11 @@ int idpf_vport_singleq_napi_poll(struct napi_struct *napi, int budget)
  * @dma:  Address of DMA buffer used for XDP TX.
  * @idx:  Index of the TX buffer in the queue.
  * @size: Size of data to be transmitted.
-  */
+ * @params: not used in single queue mode, only for function ptr compatibility.
+ */
 void idpf_prepare_xdp_tx_singleq_desc(struct idpf_queue *xdpq, dma_addr_t dma,
-				      u16 idx, u32 size)
+				      u16 idx, u32 size,
+				      __always_unused struct idpf_tx_splitq_params *params)
 {
 	struct idpf_base_tx_desc *tx_desc;
 	u64 td_cmd;

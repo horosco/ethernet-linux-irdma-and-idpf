@@ -654,13 +654,17 @@ static void irdma_poll_cq3(struct irdma_pci_f *rf)
 		cq->ibcq.comp_handler(&cq->ibcq, cq->ibcq.cq_context);
 }
 
+#define LOW_FREQ_MICROS  1000
+#define HIGH_FREQ_MICROS 25
+
 static int poll_thread(void *context)
 {
 	struct irdma_pci_f *rf = context;
+	u32 sleep_micros = LOW_FREQ_MICROS;
 
 	msleep(200);
 	do {
-		msleep(1);
+		usleep_range(sleep_micros, sleep_micros + HIGH_FREQ_MICROS);
 		if (rf->sc_dev.hw_wa & AEQ_POLL) {
 			irdma_process_aeq(rf);
 			continue;
@@ -678,6 +682,24 @@ static int poll_thread(void *context)
 			if (rf->ceqlist)
 				irdma_process_ceq(rf, rf->ceqlist);
 			irdma_process_aeq(rf);
+		}
+		if (atomic_read(&rf->ceq0_wa_enable)) {
+			struct irdma_sc_cq *ccq = &rf->ccq.sc_cq;
+
+			/* If there is a backlog, poll faster. The high freq
+			 * delay is just enough to allow the user to react to a
+			 * completed request and issue another.
+			 */
+			if (READ_ONCE(rf->sc_dev.cqp->requested_ops) !=
+			    atomic64_read(&rf->sc_dev.cqp->completed_ops)) {
+				sleep_micros = HIGH_FREQ_MICROS;
+			} else {
+				sleep_micros = LOW_FREQ_MICROS;
+				continue;
+			}
+
+			irdma_process_ceq(rf, rf->ceqlist);
+			irdma_cqp_ce_handler(rf, ccq);
 		}
 	} while (!kthread_should_stop());
 
@@ -921,11 +943,10 @@ static int irdma_probe(struct auxiliary_device *aux_dev, const struct auxiliary_
 	struct irdma_handler *hdl;
 
 	if (cdev_info->ver.major != IIDC_MAJOR_VER) {
-		pr_err("version mismatch:\n");
-		pr_err("expected major ver %d, caller specified major ver %d\n",
-		       IIDC_MAJOR_VER, cdev_info->ver.major);
-		pr_err("expected minor ver %d, caller specified minor ver %d\n",
-		       IIDC_MINOR_VER, cdev_info->ver.minor);
+		pr_info("irdma: RDMA/LAN interface version mismatch (Expected %0d.%0d Received %0d.%0d). Unable to initialize RDMA.\n",
+			IIDC_MAJOR_VER, IIDC_MINOR_VER,
+			cdev_info->ver.major, cdev_info->ver.minor);
+		pr_info("irdma: Please update both LAN and RDMA drivers from same release for interface compatibility\n");
 		return -EINVAL;
 	}
 	if (cdev_info->ver.minor != IIDC_MINOR_VER)

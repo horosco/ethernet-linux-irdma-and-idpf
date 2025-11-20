@@ -57,7 +57,7 @@ static int idpf_handle_event_link(struct idpf_adapter *adapter,
 
 	vport->link_up = v2e->link_status;
 
-	if (!np->active)
+	if (!test_bit(IDPF_VPORT_UP, np->state))
 		return 0;
 
 	if (vport->link_up) {
@@ -904,14 +904,14 @@ static int idpf_send_get_caps_msg(struct idpf_adapter *adapter)
 			    VIRTCHNL2_CAP_SEG_TX_SINGLE_TUNNEL);
 
 	caps.rss_caps =
-		cpu_to_le64(VIRTCHNL2_CAP_RSS_IPV4_TCP		|
-			    VIRTCHNL2_CAP_RSS_IPV4_UDP		|
-			    VIRTCHNL2_CAP_RSS_IPV4_SCTP		|
-			    VIRTCHNL2_CAP_RSS_IPV4_OTHER	|
-			    VIRTCHNL2_CAP_RSS_IPV6_TCP		|
-			    VIRTCHNL2_CAP_RSS_IPV6_UDP		|
-			    VIRTCHNL2_CAP_RSS_IPV6_SCTP		|
-			    VIRTCHNL2_CAP_RSS_IPV6_OTHER);
+		cpu_to_le64(VIRTCHNL2_FLOW_IPV4_TCP		|
+			    VIRTCHNL2_FLOW_IPV4_UDP		|
+			    VIRTCHNL2_FLOW_IPV4_SCTP		|
+			    VIRTCHNL2_FLOW_IPV4_OTHER		|
+			    VIRTCHNL2_FLOW_IPV6_TCP		|
+			    VIRTCHNL2_FLOW_IPV6_UDP		|
+			    VIRTCHNL2_FLOW_IPV6_SCTP		|
+			    VIRTCHNL2_FLOW_IPV6_OTHER);
 
 	caps.hsplit_caps =
 		cpu_to_le32(VIRTCHNL2_CAP_RX_HSPLIT_AT_L4V4	|
@@ -2326,7 +2326,7 @@ int idpf_send_get_stats_msg(struct idpf_vport *vport)
 	struct virtchnl2_vport_stats *stats;
 	ssize_t reply_sz;
 
-	if (!np->active)
+	if (!test_bit(IDPF_VPORT_UP, np->state))
 		return 0;
 
 	stats_msg.vport_id = cpu_to_le32(np->vport_id);
@@ -3344,6 +3344,7 @@ static void idpf_vport_set_xdp_tx_desc_handler(struct idpf_vport *vport)
 }
 
 #endif /* HAVE_XDP_SUPPORT */
+
 /**
  * idpf_vport_init - Initialize virtual port
  * @vport: virtual port to be initialized
@@ -3403,11 +3404,23 @@ int idpf_vport_init(struct idpf_vport *vport, struct idpf_vport_max_q *max_q)
 	idpf_vport_set_xdp_tx_desc_handler(vport);
 
 	if (idpf_xdp_is_prog_ena(vport))
+#if IS_ENABLED(CONFIG_ETHTOOL_NETLINK) && defined(HAVE_ETHTOOL_SUPPORT_TCP_DATA_SPLIT)
+		idpf_vport_set_hsplit(vport, ETHTOOL_TCP_DATA_SPLIT_DISABLED);
+#else
 		idpf_vport_set_hsplit(vport, false);
+#endif /* CONFIG_ETHTOOL_NETLINK && HAVE_ETHTOOL_SUPPORT_TCP_DATA_SPLIT */
 	else
+#if IS_ENABLED(CONFIG_ETHTOOL_NETLINK) && defined(HAVE_ETHTOOL_SUPPORT_TCP_DATA_SPLIT)
+		idpf_vport_set_hsplit(vport, ETHTOOL_TCP_DATA_SPLIT_ENABLED);
+#else
 		idpf_vport_set_hsplit(vport, true);
+#endif /* CONFIG_ETHTOOL_NETLINK && HAVE_ETHTOOL_SUPPORT_TCP_DATA_SPLIT */
+#else
+#if IS_ENABLED(CONFIG_ETHTOOL_NETLINK) && defined(HAVE_ETHTOOL_SUPPORT_TCP_DATA_SPLIT)
+	idpf_vport_set_hsplit(vport, ETHTOOL_TCP_DATA_SPLIT_ENABLED);
 #else
 	idpf_vport_set_hsplit(vport, true);
+#endif /* CONFIG_ETHTOOL_NETLINK && HAVE_ETHTOOL_SUPPORT_TCP_DATA_SPLIT */
 #endif /* HAVE_XDP_SUPPORT */
 
 	idpf_vport_init_num_qs(vport, vport_msg, q_grp);
@@ -3730,18 +3743,14 @@ bool idpf_is_capability_ena(struct idpf_adapter *adapter, bool all,
 		return !!(*cap_field & flag);
 }
 
-/**
- * idpf_set_mac_type: Set the mac address type
- * @vport: virtual port structure
- * @mac_addr: mac address pointer
- */
 static void idpf_set_mac_type(struct idpf_vport *vport,
 			      struct virtchnl2_mac_addr *mac_addr)
 {
-	if (ether_addr_equal(vport->default_mac_addr, mac_addr->addr))
-		mac_addr->type = VIRTCHNL2_MAC_ADDR_PRIMARY;
-	else
-		mac_addr->type = VIRTCHNL2_MAC_ADDR_EXTRA;
+	bool is_primary;
+
+	is_primary = ether_addr_equal(vport->default_mac_addr, mac_addr->addr);
+	mac_addr->type = is_primary ? VIRTCHNL2_MAC_ADDR_PRIMARY :
+				      VIRTCHNL2_MAC_ADDR_EXTRA;
 }
 
 /**
@@ -3937,7 +3946,7 @@ error:
 	if (err)
 		dev_err(idpf_adapter_to_dev(adapter), "Failed to add or del mac filters %d", err);
 
-	return 0;
+	return err;
 }
 
 /**

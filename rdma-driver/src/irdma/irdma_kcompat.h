@@ -237,7 +237,7 @@ int irdma_create_ah(struct ib_ah *ibah,
 		    struct ib_udata *udata);
 #endif
 
-#ifdef CREATE_AH_VER_4
+#if defined(CREATE_AH_VER_1_2) || defined(CREATE_AH_VER_4)
 struct ib_ah *irdma_create_ah(struct ib_pd *ibpd,
 			      struct rdma_ah_attr *attr,
 			      struct ib_udata *udata);
@@ -263,9 +263,6 @@ struct ib_ah *irdma_create_ah(struct ib_pd *ibpd,
 void irdma_ether_copy(u8 *dmac, struct ib_ah_attr *attr);
 #endif
 #if defined(CREATE_AH_VER_1_2)
-struct ib_ah *irdma_create_ah(struct ib_pd *ibpd,
-			      struct rdma_ah_attr *attr,
-			      struct ib_udata *udata);
 void irdma_ether_copy(u8 *dmac, struct rdma_ah_attr *attr);
 #endif
 

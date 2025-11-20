@@ -2388,7 +2388,7 @@ static bool irdma_check_mem_contiguous(u64 *arr, u32 npages, u32 pg_size)
 	u32 pg_idx;
 
 	for (pg_idx = 0; pg_idx < npages; pg_idx++) {
-		if ((*arr + (pg_size * pg_idx)) != arr[pg_idx])
+		if ((*arr + ((u64)pg_size * pg_idx)) != arr[pg_idx])
 			return false;
 	}
 
@@ -3106,6 +3106,8 @@ int irdma_hwdereg_mr(struct ib_mr *ib_mr)
 	info->pd_id = iwpd->sc_pd.pd_id;
 	info->stag_idx = RS_64_1(ib_mr->rkey, IRDMA_CQPSQ_STAG_IDX_S);
 	info->mr = true;
+	if (iwmr->type != IRDMA_MEMREG_TYPE_MEM)
+		info->skip_flush_markers = true;
 	if (iwpbl->pbl_allocated)
 		info->dealloc_pbl = true;
 
@@ -3418,7 +3420,10 @@ static int irdma_post_send(struct ib_qp *ibqp,
 				info.op.send.qkey = ud_wr(ib_wr)->remote_qkey;
 				info.op.send.dest_qp = ud_wr(ib_wr)->remote_qpn;
 			}
-
+#ifdef CONFIG_DEBUG_FS
+			if (iwqp->ibqp.qp_type == IB_QPT_GSI)
+				iwqp->iwdev->mad_qp_posted_send_wrs++;
+#endif
 			if (ib_wr->send_flags & IB_SEND_INLINE) {
 				err = irdma_uk_inline_send(ukqp, &info, false);
 			} else {
@@ -3611,7 +3616,10 @@ static int irdma_post_recv(struct ib_qp *ibqp,
 				  "VERBS: post_recv err %d\n", err);
 			goto out;
 		}
-
+#ifdef CONFIG_DEBUG_FS
+		if (iwqp->ibqp.qp_type == IB_QPT_GSI)
+			iwqp->iwdev->mad_qp_posted_recv_wrs++;
+#endif
 		ib_wr = ib_wr->next;
 	}
 
@@ -3669,6 +3677,9 @@ static void irdma_process_cqe(struct ib_wc *entry,
 			      struct irdma_cq_poll_info *cq_poll_info)
 {
 	struct irdma_sc_qp *qp;
+#ifdef CONFIG_DEBUG_FS
+	struct irdma_device *iwdev;
+#endif
 
 	entry->wc_flags = 0;
 	entry->pkey_index = 0;
@@ -3676,14 +3687,29 @@ static void irdma_process_cqe(struct ib_wc *entry,
 
 	qp = cq_poll_info->qp_handle;
 	entry->qp = qp->qp_uk.back_qp;
+#ifdef CONFIG_DEBUG_FS
+	iwdev = to_iwdev(to_ibdev(qp->dev));
+#endif
 
 	if (cq_poll_info->error) {
+#ifdef CONFIG_DEBUG_FS
+		if (entry->qp->qp_type == IB_QPT_GSI)
+			iwdev->mad_qp_completed_error_wrs++;
+#endif
 		entry->status = (cq_poll_info->comp_status == IRDMA_COMPL_STATUS_FLUSHED) ?
 				irdma_flush_err_to_ib_wc_status(cq_poll_info->minor_err) : IB_WC_GENERAL_ERR;
 
 		entry->vendor_err = cq_poll_info->major_err << 16 |
 				    cq_poll_info->minor_err;
 	} else {
+#ifdef CONFIG_DEBUG_FS
+		if (entry->qp->qp_type == IB_QPT_GSI) {
+			if (cq_poll_info->q_type == IRDMA_CQE_QTYPE_SQ)
+				iwdev->mad_qp_completed_send_wrs++;
+			else
+				iwdev->mad_qp_completed_recv_wrs++;
+		}
+#endif
 		entry->status = IB_WC_SUCCESS;
 		if (cq_poll_info->imm_valid) {
 			entry->ex.imm_data = htonl(cq_poll_info->imm_data);
