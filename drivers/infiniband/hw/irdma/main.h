@@ -323,7 +323,7 @@ struct irdma_pci_f {
 	spinlock_t qptable_lock; /*protect QP table access*/
 	spinlock_t cqtable_lock; /*protect CQ table access*/
 	struct irdma_qp **qp_table;
-	struct irdma_cq **cq_table;
+	void **cq_table;
 	spinlock_t qh_list_lock; /* protect mc_qht_list */
 	struct mc_table_list mc_qht_list;
 	struct irdma_msix_vector *iw_msixtbl;
