@@ -2669,7 +2669,7 @@ static int irdma_create_cq(struct ib_cq *ibcq,
 			goto cq_destroy;
 		}
 	}
-	rf->cq_table[cq_num] = iwcq;
+	WRITE_ONCE(rf->cq_table[cq_num], iwcq);
 	init_completion(&iwcq->free_cq);
 
 	return 0;
