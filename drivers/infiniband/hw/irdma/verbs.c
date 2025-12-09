@@ -5094,10 +5094,8 @@ static int irdma_setup_ah(struct ib_ah *ibah, struct rdma_ah_init_attr *attr)
 			ntohl(sgid_addr.saddr_in.sin_addr.s_addr);
 		ah_info->do_lpbk = irdma_ipv4_is_lpb(ah_info->src_ip_addr[0],
 						     ah_info->dest_ip_addr[0]);
-		if (ipv4_is_multicast(dgid_addr.saddr_in.sin_addr.s_addr)) {
-			ah_info->do_lpbk = true;
+		if (ipv4_is_multicast(dgid_addr.saddr_in.sin_addr.s_addr))
 			irdma_mcast_mac(ah_info->dest_ip_addr, dmac, true);
-		}
 	} else {
 		irdma_copy_ip_ntohl(ah_info->dest_ip_addr,
 				    dgid_addr.saddr_in6.sin6_addr.in6_u.u6_addr32);
@@ -5105,10 +5103,8 @@ static int irdma_setup_ah(struct ib_ah *ibah, struct rdma_ah_init_attr *attr)
 				    sgid_addr.saddr_in6.sin6_addr.in6_u.u6_addr32);
 		ah_info->do_lpbk = irdma_ipv6_is_lpb(ah_info->src_ip_addr,
 						     ah_info->dest_ip_addr);
-		if (rdma_is_multicast_addr(&dgid_addr.saddr_in6.sin6_addr)) {
-			ah_info->do_lpbk = true;
+		if (rdma_is_multicast_addr(&dgid_addr.saddr_in6.sin6_addr))
 			irdma_mcast_mac(ah_info->dest_ip_addr, dmac, false);
-		}
 	}
 
 	err = rdma_read_gid_l2_fields(sgid_attr, &ah_info->vlan_tag,
