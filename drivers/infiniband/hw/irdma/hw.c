@@ -114,7 +114,7 @@ static void irdma_process_ceq(struct irdma_pci_f *rf, struct irdma_ceq *ceq)
 	do {
 		spin_lock_irqsave(&ceq->ce_lock, flags);
 		cq = irdma_sc_process_ceq(dev, sc_ceq);
-		if (!cq || rf->reset) {
+		if (!cq) {
 			spin_unlock_irqrestore(&ceq->ce_lock, flags);
 			break;
 		}
