@@ -1629,6 +1629,7 @@ static int irdma_sc_dealloc_stag(struct irdma_sc_dev *dev,
 
 	hdr = FIELD_PREP(IRDMA_CQPSQ_OPCODE, IRDMA_CQP_OP_DEALLOC_STAG) |
 	      FIELD_PREP(IRDMA_CQPSQ_STAG_MR, info->mr) |
+	      FIELD_PREP(IRDMA_CQPSQ_STAG_SKIPFLUSH, info->skip_flush_markers) |
 	      FIELD_PREP(IRDMA_CQPSQ_WQEVALID, cqp->polarity);
 	dma_wmb(); /* make sure WQE is written before valid bit is set */
 

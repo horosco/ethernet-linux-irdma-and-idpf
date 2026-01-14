@@ -1182,6 +1182,7 @@ struct irdma_dealloc_stag_info {
 	u32 pd_id;
 	bool mr:1;
 	bool dealloc_pbl:1;
+	bool skip_flush_markers:1;
 };
 
 struct irdma_register_shared_stag {
