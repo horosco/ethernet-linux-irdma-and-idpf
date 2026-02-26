@@ -558,7 +558,8 @@ static int irdma_destroy_qp(struct ib_qp *ibqp, struct ib_udata *udata)
 	}
 
 	irdma_qp_rem_ref(&iwqp->ibqp);
-	wait_for_completion(&iwqp->free_qp);
+	if (!iwdev->rf->reset)
+		wait_for_completion(&iwqp->free_qp);
 	irdma_free_lsmm_rsrc(iwqp);
 	irdma_cqp_qp_destroy_cmd(&iwdev->rf->sc_dev, &iwqp->sc_qp);
 
@@ -1462,8 +1463,6 @@ int irdma_modify_qp_roce(struct ib_qp *ibqp, struct ib_qp_attr *attr,
 				ctx_info->remote_atomics_en = true;
 	}
 
-	wait_event(iwqp->mod_qp_waitq, !atomic_read(&iwqp->hw_mod_qp_pend));
-
 	ibdev_dbg(&iwdev->ibdev,
 		  "VERBS: caller: %pS qp_id=%d to_ibqpstate=%d ibqpstate=%d irdma_qpstate=%d attr_mask=0x%x\n",
 		  __builtin_return_address(0), ibqp->qp_num, attr->qp_state,
@@ -1540,6 +1539,7 @@ int irdma_modify_qp_roce(struct ib_qp *ibqp, struct ib_qp_attr *attr,
 		case IB_QPS_ERR:
 		case IB_QPS_RESET:
 			if (iwqp->iwarp_state == IRDMA_QP_STATE_ERROR) {
+				iwqp->ibqp_state = attr->qp_state;
 				spin_unlock_irqrestore(&iwqp->lock, flags);
 				if (udata && udata->inlen) {
 					if (ib_copy_from_udata(&ureq, udata,
@@ -1745,6 +1745,7 @@ int irdma_modify_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr, int attr_mask,
 		case IB_QPS_ERR:
 		case IB_QPS_RESET:
 			if (iwqp->iwarp_state == IRDMA_QP_STATE_ERROR) {
+				iwqp->ibqp_state = attr->qp_state;
 				spin_unlock_irqrestore(&iwqp->lock, flags);
 				if (udata && udata->inlen) {
 					if (ib_copy_from_udata(&ureq, udata,
@@ -5035,8 +5036,8 @@ static int irdma_create_hw_ah(struct irdma_device *iwdev, struct irdma_ah *ah, b
 
 		if (poll_timeout_us_atomic(irdma_cqp_ce_handler(rf,
 								&rf->ccq.sc_cq),
-					   ah->sc_ah.ah_info.ah_valid, 1,
-					   tmout_ms * USEC_PER_MSEC, false)) {
+					   atomic_read(&ah->sc_ah.ah_info.ah_valid),
+					   1, tmout_ms * USEC_PER_MSEC, false)) {
 			ibdev_dbg(&iwdev->ibdev,
 				  "VERBS: CQP create AH timed out");
 			err = -ETIMEDOUT;
@@ -5093,10 +5094,8 @@ static int irdma_setup_ah(struct ib_ah *ibah, struct rdma_ah_init_attr *attr)
 			ntohl(sgid_addr.saddr_in.sin_addr.s_addr);
 		ah_info->do_lpbk = irdma_ipv4_is_lpb(ah_info->src_ip_addr[0],
 						     ah_info->dest_ip_addr[0]);
-		if (ipv4_is_multicast(dgid_addr.saddr_in.sin_addr.s_addr)) {
-			ah_info->do_lpbk = true;
+		if (ipv4_is_multicast(dgid_addr.saddr_in.sin_addr.s_addr))
 			irdma_mcast_mac(ah_info->dest_ip_addr, dmac, true);
-		}
 	} else {
 		irdma_copy_ip_ntohl(ah_info->dest_ip_addr,
 				    dgid_addr.saddr_in6.sin6_addr.in6_u.u6_addr32);
@@ -5104,10 +5103,8 @@ static int irdma_setup_ah(struct ib_ah *ibah, struct rdma_ah_init_attr *attr)
 				    sgid_addr.saddr_in6.sin6_addr.in6_u.u6_addr32);
 		ah_info->do_lpbk = irdma_ipv6_is_lpb(ah_info->src_ip_addr,
 						     ah_info->dest_ip_addr);
-		if (rdma_is_multicast_addr(&dgid_addr.saddr_in6.sin6_addr)) {
-			ah_info->do_lpbk = true;
+		if (rdma_is_multicast_addr(&dgid_addr.saddr_in6.sin6_addr))
 			irdma_mcast_mac(ah_info->dest_ip_addr, dmac, false);
-		}
 	}
 
 	err = rdma_read_gid_l2_fields(sgid_attr, &ah_info->vlan_tag,
@@ -5155,7 +5152,8 @@ static bool irdma_ah_exists(struct irdma_device *iwdev,
 	hash_for_each_possible(iwdev->rf->ah_hash_tbl, ah, list, key) {
 		/* Set ah_valid and ah_id the same so memcmp can work */
 		new_ah->sc_ah.ah_info.ah_idx = ah->sc_ah.ah_info.ah_idx;
-		new_ah->sc_ah.ah_info.ah_valid = ah->sc_ah.ah_info.ah_valid;
+		atomic_set(&new_ah->sc_ah.ah_info.ah_valid,
+			   atomic_read(&ah->sc_ah.ah_info.ah_valid));
 		if (!memcmp(&ah->sc_ah.ah_info, &new_ah->sc_ah.ah_info,
 			    sizeof(ah->sc_ah.ah_info))) {
 			refcount_inc(&ah->refcnt);
