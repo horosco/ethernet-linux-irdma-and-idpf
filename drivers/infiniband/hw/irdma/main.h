@@ -37,8 +37,8 @@
 #include <rdma/rdma_cm.h>
 #include <rdma/iw_cm.h>
 #include <rdma/ib_user_verbs.h>
-#include <rdma/ib_umem.h>
 #include <rdma/ib_cache.h>
+#include <rdma/iter.h>
 #include <rdma/uverbs_ioctl.h>
 #include "osdep.h"
 #include "defs.h"
@@ -167,7 +167,7 @@ struct irdma_cqp_request {
 	void (*callback_fcn)(struct irdma_cqp_request *cqp_request);
 	void *param;
 	struct irdma_cqp_compl_info compl_info;
-	atomic_t request_done;
+	bool request_done; /* READ/WRITE_ONCE macros operate on it */
 	bool waiting:1;
 	bool dynamic:1;
 	bool pending:1;
